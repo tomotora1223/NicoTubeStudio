@@ -1,0 +1,18 @@
+# Node / Electron
+node_modules/
+dist/
+dist-ui/
+*.log
+
+# Python / PyInstaller
+backend/.venv/
+backend/build/
+backend/dist/
+backend/bin/
+backend/data/
+**/__pycache__/
+*.py[cod]
+
+# OS / Editor
+.DS_Store
+Thumbs.db
