@@ -190,7 +190,8 @@ class ToolUpdateManager:
 
             async with httpx.AsyncClient(
                 follow_redirects=True,
-                timeout=httpx.Timeout(15.0, connect=8.0),
+                timeout=httpx.Timeout(12.0, connect=8.0, read=10.0),
+                headers={"User-Agent": "NicoTubeStudio/1.0"},
             ) as client:
                 resp = await client.get(FFMPEG_VERSION_URL)
                 resp.raise_for_status()
@@ -252,11 +253,15 @@ class ToolUpdateManager:
             await self._broadcast()
             try:
                 await asyncio.gather(
-                    self._ensure_deno_if_missing(),
-                    self._update_ytdlp(),
-                    self._update_ffmpeg(),
+                    asyncio.wait_for(self._ensure_deno_if_missing(), timeout=150.0),
+                    asyncio.wait_for(self._update_ytdlp(), timeout=150.0),
+                    asyncio.wait_for(self._update_ffmpeg(), timeout=180.0),
                     return_exceptions=True,
                 )
+                if "確認中" in self.status.ffmpeg_status or "ダウンロード中" in self.status.ffmpeg_status:
+                    self.status.ffmpeg_status = "導入済み" if self.status.ffmpeg_version not in ("", "未導入") else "確認タイムアウト"
+                if "確認中" in self.status.ytdlp_status:
+                    self.status.ytdlp_status = "利用可能" if self.status.ytdlp_version else "確認タイムアウト"
                 self.status.last_checked_at = time.time()
             finally:
                 self.status.checking = False

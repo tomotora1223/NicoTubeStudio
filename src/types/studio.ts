@@ -221,6 +221,8 @@ export interface AppSettings {
   auto_update_app: boolean
   update_feed_url: string
   style_server_url: string
+  encode_config?: EncodeConfig
+  last_comment_style?: CommentStyleConfig | null
 }
 
 export interface EncoderProbeResult {

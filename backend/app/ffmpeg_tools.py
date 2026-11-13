@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -193,7 +194,11 @@ async def download_ffmpeg(
     if progress_cb:
         progress_cb(0.02, "FFmpegビルドをダウンロード中...")
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=240.0) as client:
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(120.0, connect=15.0, read=30.0),
+        headers={"User-Agent": "NicoTubeStudio/1.0"},
+    ) as client:
         async with client.stream("GET", FFMPEG_RELEASE_ZIP_URL) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("content-length") or 0)
@@ -209,16 +214,19 @@ async def download_ffmpeg(
     if progress_cb:
         progress_cb(0.88, "FFmpegを展開中...")
 
-    with zipfile.ZipFile(tmp_zip, "r") as zf:
-        for member in zf.namelist():
-            low = member.lower()
-            if low.endswith("/bin/ffmpeg.exe") or low.endswith("/bin/ffprobe.exe"):
-                filename = Path(member).name
-                target = BIN_DIR / filename
-                tmp_target = BIN_DIR / f"{filename}.new"
-                with zf.open(member) as src, open(tmp_target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                tmp_target.replace(target)
+    def _extract_binaries() -> None:
+        with zipfile.ZipFile(tmp_zip, "r") as zf:
+            for member in zf.namelist():
+                low = member.lower()
+                if low.endswith("/bin/ffmpeg.exe") or low.endswith("/bin/ffprobe.exe"):
+                    filename = Path(member).name
+                    target = BIN_DIR / filename
+                    tmp_target = BIN_DIR / f"{filename}.new"
+                    with zf.open(member) as src, open(tmp_target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    tmp_target.replace(target)
+
+    await asyncio.to_thread(_extract_binaries)
 
     try:
         tmp_zip.unlink(missing_ok=True)
@@ -237,7 +245,7 @@ async def download_ffmpeg(
         progress_cb(0.95, "ハードウェアエンコーダを検証中...")
 
     ensure_ffmpeg_in_path()
-    result = probe_encoders(force=True)
+    result = await asyncio.to_thread(probe_encoders, True)
     if progress_cb:
         progress_cb(1.0, "FFmpegの準備が完了しました")
     return result

@@ -247,6 +247,8 @@ class AppSettings(BaseModel):
     auto_update_app: bool = True
     update_feed_url: str = "tomotora1223/NicoTubeStudio"
     style_server_url: str = ""
+    encode_config: EncodeConfig = Field(default_factory=EncodeConfig)
+    last_comment_style: Optional[CommentStyleConfig] = None
 
 
 class SystemFontInfo(BaseModel):

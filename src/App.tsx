@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { CaptureWorkspace } from './components/CaptureWorkspace'
 import { CommentStudioView } from './components/CommentStudioView'
@@ -36,7 +36,13 @@ export default function App() {
     auto_update_app: true,
     update_feed_url: 'tomotora1223/NicoTubeStudio',
     style_server_url: '',
+    encode_config: DEFAULT_ENCODE_CONFIG,
+    last_comment_style: null,
   })
+  const settingsRef = useRef<AppSettings>(settings)
+  settingsRef.current = settings
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const [presets, setPresets] = useState<Preset[]>([])
   const [activePresetId, setActivePresetId] = useState('niconico-official')
   const [commentStyle, setCommentStyle] = useState<CommentStyleConfig>(DEFAULT_COMMENT_STYLE)
@@ -65,11 +71,19 @@ export default function App() {
         api.getQueue(),
         api.getToolUpdateStatus().catch(() => null),
       ])
+      settingsRef.current = s
       setSettings(s)
       setPresets(pList)
+      if (s.encode_config) {
+        setEncodeConfig({ ...DEFAULT_ENCODE_CONFIG, ...s.encode_config })
+      }
       const chosen = pList.find((p) => p.id === s.active_preset_id) || pList[0]
       if (chosen) {
         setActivePresetId(chosen.id)
+      }
+      if (s.last_comment_style) {
+        setCommentStyle(normalizeCommentStyle(s.last_comment_style))
+      } else if (chosen) {
         setCommentStyle(normalizeCommentStyle(chosen.config))
       }
       setEncoders(enc)
@@ -96,6 +110,9 @@ export default function App() {
       const wsUrl = base.replace(/^http/, 'ws') + '/ws/events'
       if (closed) return
       ws = new WebSocket(wsUrl)
+      ws.onopen = () => {
+        api.getToolUpdateStatus().then(setToolUpdateStatus).catch(() => {})
+      }
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data)
@@ -152,12 +169,69 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!ready) return
+    if (activeTab === 'settings') {
+      api.getToolUpdateStatus().then(setToolUpdateStatus).catch(() => {})
+    }
+  }, [activeTab, ready])
+
+  useEffect(() => {
+    if (!ready) return
+    const isBusy =
+      Boolean(toolUpdateStatus?.checking) ||
+      Boolean(toolUpdateStatus?.ffmpeg_status?.includes('確認中')) ||
+      Boolean(toolUpdateStatus?.ytdlp_status?.includes('確認中'))
+    if (!isBusy) return
+    const timer = setInterval(() => {
+      api.getToolUpdateStatus().then(setToolUpdateStatus).catch(() => {})
+    }, 1500)
+    return () => clearInterval(timer)
+  }, [
+    ready,
+    toolUpdateStatus?.checking,
+    toolUpdateStatus?.ffmpeg_status,
+    toolUpdateStatus?.ytdlp_status,
+  ])
+
+  const persistSettingsPatch = useCallback((patch: Partial<AppSettings>) => {
+    const merged: AppSettings = { ...settingsRef.current, ...patch }
+    settingsRef.current = merged
+    setSettings(merged)
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(() => {
+      api.updateSettings(settingsRef.current).catch(() => {})
+    }, 250)
+  }, [])
+
+  const handleChangeEncode = useCallback(
+    (next: EncodeConfig) => {
+      setEncodeConfig(next)
+      persistSettingsPatch({ encode_config: next })
+    },
+    [persistSettingsPatch],
+  )
+
+  const handleChangeCommentStyle = useCallback(
+    (next: CommentStyleConfig) => {
+      setCommentStyle(next)
+      persistSettingsPatch({ last_comment_style: next })
+    },
+    [persistSettingsPatch],
+  )
+
   const handleSelectPreset = async (id: string) => {
     const found = presets.find((p) => p.id === id)
     if (!found) return
+    const normalized = normalizeCommentStyle(found.config)
     setActivePresetId(id)
-    setCommentStyle(normalizeCommentStyle(found.config))
-    const nextSettings = { ...settings, active_preset_id: id }
+    setCommentStyle(normalized)
+    const nextSettings: AppSettings = {
+      ...settingsRef.current,
+      active_preset_id: id,
+      last_comment_style: normalized,
+    }
+    settingsRef.current = nextSettings
     setSettings(nextSettings)
     api.updateSettings(nextSettings).catch(() => {})
   }
@@ -167,7 +241,12 @@ export default function App() {
     const list = await api.getPresets()
     setPresets(list)
     setActivePresetId(created.id)
-    const nextSettings = { ...settings, active_preset_id: created.id }
+    const nextSettings: AppSettings = {
+      ...settingsRef.current,
+      active_preset_id: created.id,
+      last_comment_style: cfg,
+    }
+    settingsRef.current = nextSettings
     setSettings(nextSettings)
     await api.updateSettings(nextSettings)
   }
@@ -181,6 +260,7 @@ export default function App() {
     await api.updatePreset(id, name, description, cfg)
     const list = await api.getPresets()
     setPresets(list)
+    persistSettingsPatch({ last_comment_style: cfg })
   }
 
   const handleDeletePreset = async (id: string) => {
@@ -193,7 +273,14 @@ export default function App() {
   }
 
   const handleUpdateSettings = async (next: AppSettings) => {
-    const saved = await api.updateSettings(next)
+    const merged: AppSettings = {
+      ...next,
+      encode_config: next.encode_config ?? settingsRef.current.encode_config,
+      last_comment_style: next.last_comment_style ?? settingsRef.current.last_comment_style,
+    }
+    settingsRef.current = merged
+    const saved = await api.updateSettings(merged)
+    settingsRef.current = saved
     setSettings(saved)
   }
 
@@ -230,7 +317,7 @@ export default function App() {
         <div className={activeTab === 'capture' ? 'block' : 'hidden'}>
           <CaptureWorkspace
             encodeConfig={encodeConfig}
-            onChangeEncode={setEncodeConfig}
+            onChangeEncode={handleChangeEncode}
             presets={presets}
             activePresetId={activePresetId}
             onSelectPreset={handleSelectPreset}
@@ -251,7 +338,7 @@ export default function App() {
         <div className={activeTab === 'comments' ? 'block' : 'hidden'}>
           <CommentStudioView
             styleConfig={commentStyle}
-            onChangeStyle={setCommentStyle}
+            onChangeStyle={handleChangeCommentStyle}
             presets={presets}
             activePresetId={activePresetId}
             onSelectPreset={handleSelectPreset}
@@ -300,7 +387,7 @@ export default function App() {
         open={fullscreenOpen}
         onClose={() => setFullscreenOpen(false)}
         styleConfig={commentStyle}
-        onChangeStyle={setCommentStyle}
+        onChangeStyle={handleChangeCommentStyle}
         thumbnailUrl={previewThumb}
       />
     </div>

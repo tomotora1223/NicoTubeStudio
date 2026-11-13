@@ -419,6 +419,9 @@ async def ws_events(websocket: WebSocket) -> None:
         await websocket.send_json(
             {"type": "queue_snapshot", "payload": [j.model_dump() for j in queue_manager.list_jobs()]}
         )
+        await websocket.send_json(
+            {"type": "tool_update_status", "payload": tool_updater.status.model_dump()}
+        )
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
