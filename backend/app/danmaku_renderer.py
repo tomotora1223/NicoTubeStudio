@@ -653,6 +653,8 @@ def burn_danmaku_with_ffmpeg(
     if clip_duration_sec is not None and clip_duration_sec > 0:
         clip_in_args += ["-t", f"{clip_duration_sec:.3f}"]
 
+    even_pad = ",pad=ceil(iw/2)*2:ceil(ih/2)*2" if (width % 2 != 0 or height % 2 != 0) else ""
+
     def _run_pass(in_hw_args: list[str]) -> tuple[int, str]:
         cmd = [
             ffmpeg_exe,
@@ -679,7 +681,7 @@ def burn_danmaku_with_ffmpeg(
             "-i",
             "pipe:0",
             "-filter_complex",
-            f"[0:v]fps={fps:.6f},format=yuv420p[bg];[1:v]format=bgra[ov];[bg][ov]overlay=0:0:shortest=1:alpha=premultiplied[v]",
+            f"[0:v]fps={fps:.6f},format=yuv420p[bg];[1:v]format=bgra[ov];[bg][ov]overlay=0:0:shortest=1:alpha=premultiplied{even_pad}[v]",
             "-map",
             "[v]",
             "-map",
@@ -787,7 +789,10 @@ def burn_danmaku_with_ffmpeg(
                         pass
                     raise RuntimeError("ジョブがキャンセルされました")
                 if write_err:
-                    raise write_err[0]
+                    err0 = write_err[0]
+                    if isinstance(err0, (BrokenPipeError, OSError)):
+                        break
+                    raise err0
 
                 t = frame_idx / fps
 
@@ -841,9 +846,9 @@ def burn_danmaku_with_ffmpeg(
 
             write_q.put(None)
             writer_thread.join(timeout=30.0)
-            if write_err and not isinstance(write_err[0], BrokenPipeError):
+            if write_err and not isinstance(write_err[0], (BrokenPipeError, OSError)):
                 raise write_err[0]
-        except BrokenPipeError:
+        except (BrokenPipeError, OSError):
             pass
         finally:
             try:
@@ -867,7 +872,7 @@ def burn_danmaku_with_ffmpeg(
 
     try:
         ret, err = _run_pass(hw_dec_args)
-    except BrokenPipeError:
+    except (BrokenPipeError, OSError):
         if hw_dec_args and not (cancel_event and cancel_event.is_set()):
             ret, err = _run_pass([])
         else:

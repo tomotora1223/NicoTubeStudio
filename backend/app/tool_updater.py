@@ -158,15 +158,27 @@ class ToolUpdateManager:
                 whl_resp = await client.get(whl_url, timeout=httpx.Timeout(120.0, connect=10.0))
                 whl_resp.raise_for_status()
 
-            # Extract into staging folder and swap cleanly
+            # Extract into staging folder and swap cleanly (safe on Windows locks)
             staging = YTDLP_LIVE_DIR.parent / "ytdlp_live_staging"
+            backup = YTDLP_LIVE_DIR.parent / "ytdlp_live_prev"
             shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(backup, ignore_errors=True)
             staging.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(io.BytesIO(whl_resp.content)) as zf:
                 zf.extractall(staging)
 
-            shutil.rmtree(YTDLP_LIVE_DIR, ignore_errors=True)
-            staging.replace(YTDLP_LIVE_DIR)
+            if YTDLP_LIVE_DIR.exists():
+                try:
+                    YTDLP_LIVE_DIR.replace(backup)
+                except OSError:
+                    shutil.rmtree(YTDLP_LIVE_DIR, ignore_errors=True)
+            try:
+                staging.replace(YTDLP_LIVE_DIR)
+            except OSError:
+                if backup.exists() and not YTDLP_LIVE_DIR.exists():
+                    backup.replace(YTDLP_LIVE_DIR)
+                raise
+            shutil.rmtree(backup, ignore_errors=True)
 
             await asyncio.to_thread(_reload_ytdlp_from_live_dir)
             import yt_dlp as updated_ytdlp

@@ -3,6 +3,8 @@ import {
   CheckCircle2,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
   FolderOpen,
   KeyRound,
   Loader2,
@@ -153,7 +155,7 @@ export function SettingsAuthView({
               color: authStatus?.logged_in ? 'var(--md-positive)' : 'var(--md-on-surface-muted)',
             }}
           >
-            {authStatus?.logged_in && <CheckCircle2 size={14} strokeWidth={1.6} />}
+            {authStatus?.logged_in && <CheckCircle2 size={14} strokeWidth={1.5} />}
             <span>
               {authStatus?.logged_in
                 ? `ログイン済み (${authStatus.cookie_count} cookies)`
@@ -169,7 +171,7 @@ export function SettingsAuthView({
             className="flex h-9 items-center gap-2 rounded-lg px-4 text-[13px] font-medium"
             style={{ backgroundColor: 'var(--md-primary)', color: 'var(--md-on-primary)' }}
           >
-            <LogIn size={15} strokeWidth={1.6} />
+            <LogIn size={15} strokeWidth={1.5} />
             <span>アプリ内ブラウザでGoogleログイン</span>
           </button>
 
@@ -276,7 +278,7 @@ export function SettingsAuthView({
                 {installingFfmpeg ? (
                   <Loader2 size={14} className="animate-spin" />
                 ) : (
-                  <Download size={14} strokeWidth={1.6} />
+                  <Download size={14} strokeWidth={1.5} />
                 )}
                 <span>{installingFfmpeg ? '導入中...' : 'FFmpegを自動インストール'}</span>
               </button>
@@ -596,7 +598,7 @@ export function SettingsAuthView({
               NicoTube Studio 本体
             </div>
             <div className="font-mono-tabular mt-1 text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
-              v{appUpdateState?.version || '0.2.2'}
+              v{appUpdateState?.version || '0.2.3'}
             </div>
             <div
               className="mt-0.5 truncate text-[11px]"
@@ -740,6 +742,7 @@ function StyleServerRow({
 }) {
   const [draft, setDraft] = useState(value)
   const [tokenDraft, setTokenDraft] = useState(githubToken)
+  const [showToken, setShowToken] = useState(false)
   const [authorDraft, setAuthorDraft] = useState(authorName)
   const [saved, setSaved] = useState(false)
 
@@ -784,18 +787,31 @@ function StyleServerRow({
         />
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <input
-          type="password"
-          value={tokenDraft}
-          onChange={(e) => setTokenDraft(e.target.value)}
-          placeholder="GitHub Personal Access Token (gist 権限のみ・任意)"
-          className="h-8 min-w-[260px] flex-1 rounded-lg border px-2.5 text-[12px] outline-none"
+        <div
+          className="flex h-8 min-w-[260px] flex-1 items-center gap-1 rounded-lg border px-2.5"
           style={{
             backgroundColor: 'var(--md-surface)',
             borderColor: 'var(--md-outline-variant)',
-            color: 'var(--md-on-surface)',
           }}
-        />
+        >
+          <input
+            type={showToken ? 'text' : 'password'}
+            value={tokenDraft}
+            onChange={(e) => setTokenDraft(e.target.value)}
+            placeholder="GitHub Personal Access Token (gist 権限のみ・任意)"
+            className="w-full bg-transparent text-[12px] outline-none"
+            style={{ color: 'var(--md-on-surface)' }}
+          />
+          <button
+            type="button"
+            onClick={() => setShowToken((v) => !v)}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-[var(--md-surface-high)]"
+            style={{ color: 'var(--md-on-surface-muted)' }}
+            title={showToken ? 'トークンを隠す' : 'トークンを表示'}
+          >
+            {showToken ? <EyeOff size={13} strokeWidth={1.5} /> : <Eye size={13} strokeWidth={1.5} />}
+          </button>
+        </div>
         <button
           type="button"
           onClick={async () => {

@@ -91,7 +91,7 @@ export function FullscreenPreviewModal({
               color: showQuickTweak ? '#f59c97' : '#ededed',
             }}
           >
-            <SlidersHorizontal size={14} strokeWidth={1.6} />
+            <SlidersHorizontal size={14} strokeWidth={1.5} />
             <span>ライブ微調整</span>
           </button>
 
@@ -105,7 +105,7 @@ export function FullscreenPreviewModal({
               color: '#ededed',
             }}
           >
-            <Monitor size={14} strokeWidth={1.6} />
+            <Monitor size={14} strokeWidth={1.5} />
             <span>{isNativeFs ? 'ウィンドウに戻す' : 'モニター全画面'}</span>
           </button>
 
@@ -120,7 +120,7 @@ export function FullscreenPreviewModal({
             }}
             title="閉じる (Esc)"
           >
-            <X size={15} strokeWidth={1.8} />
+            <X size={15} strokeWidth={1.5} />
             <span>閉じる (Esc)</span>
           </button>
         </div>
@@ -237,7 +237,7 @@ export function FullscreenPreviewModal({
             color: '#ededed',
           }}
         >
-          <X size={13} strokeWidth={1.8} />
+          <X size={13} strokeWidth={1.5} />
           <span>全画面プレビューを終了 (Esc)</span>
         </button>
       </div>

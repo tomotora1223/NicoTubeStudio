@@ -3,6 +3,7 @@ import Hls from 'hls.js'
 import {
   AlertCircle,
   CheckCircle2,
+  ClipboardPaste,
   Cpu,
   ExternalLink,
   Film,
@@ -16,6 +17,7 @@ import {
   Scissors,
   Search,
   SlidersHorizontal,
+  X,
 } from 'lucide-react'
 import { api, formatDuration, parseTimecode } from '../lib/api'
 import type {
@@ -59,6 +61,13 @@ export function CaptureWorkspace({
   onVideoProbed,
 }: CaptureWorkspaceProps) {
   const clipVideoRef = useRef<HTMLVideoElement | null>(null)
+  const timelineTrackRef = useRef<HTMLDivElement | null>(null)
+  const dragStateRef = useRef<{
+    mode: 'start' | 'end' | 'window' | 'playhead'
+    anchorX: number
+    initStart: number
+    initEnd: number
+  } | null>(null)
   const [url, setUrl] = useState('')
   const [probing, setProbing] = useState(false)
   const [probeError, setProbeError] = useState<string | null>(null)
@@ -73,7 +82,10 @@ export function CaptureWorkspace({
   const [showRangePreview, setShowRangePreview] = useState(true)
   const [previewCurrentSec, setPreviewCurrentSec] = useState(0)
   const [previewPlaying, setPreviewPlaying] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const [loopSegment, setLoopSegment] = useState(false)
+  const [activeDragMode, setActiveDragMode] = useState<'start' | 'end' | 'window' | 'playhead' | null>(null)
 
   const [submitting, setSubmitting] = useState(false)
   const [queuedNotice, setQueuedNotice] = useState<string | null>(null)
@@ -213,14 +225,28 @@ export function CaptureWorkspace({
     const srcUrl = videoInfo?.preview_stream_url
     if (!clipEnabled || !showRangePreview || !vid || !srcUrl) {
       setPreviewPlaying(false)
+      setPreviewLoading(false)
+      setPreviewError(null)
       return
     }
+
+    setPreviewLoading(true)
+    setPreviewError(null)
 
     let hls: Hls | null = null
     if (srcUrl.includes('.m3u8') && Hls.isSupported()) {
       hls = new Hls({ enableWorker: true, lowLatencyMode: false })
       hls.loadSource(srcUrl)
       hls.attachMedia(vid)
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setPreviewLoading(false)
+      })
+      hls.on(Hls.Events.ERROR, (_ev, data) => {
+        if (data.fatal) {
+          setPreviewLoading(false)
+          setPreviewError('プレビュー映像の読み込みに失敗しました（時刻指定での切り抜きは利用できます）')
+        }
+      })
     } else {
       vid.src = srcUrl
     }
@@ -234,6 +260,76 @@ export function CaptureWorkspace({
       vid.load()
     }
   }, [videoInfo?.preview_stream_url, showRangePreview, clipEnabled])
+
+  const secFromClientX = (clientX: number): number => {
+    const el = timelineTrackRef.current
+    if (!el || totalDur <= 0) return 0
+    const rect = el.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)))
+    return Math.round(ratio * totalDur)
+  }
+
+  const handleTimelinePointerDown = (
+    mode: 'start' | 'end' | 'window' | 'playhead',
+    e: React.PointerEvent<HTMLElement>
+  ) => {
+    e.stopPropagation()
+    e.currentTarget.setPointerCapture(e.pointerId)
+    dragStateRef.current = {
+      mode,
+      anchorX: e.clientX,
+      initStart: clipStart,
+      initEnd: clipEnd,
+    }
+    setActiveDragMode(mode)
+    if (mode === 'playhead') {
+      seekPreviewTo(secFromClientX(e.clientX))
+    }
+  }
+
+  const handleTimelinePointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    const ds = dragStateRef.current
+    if (!ds || !timelineTrackRef.current) return
+    const rect = timelineTrackRef.current.getBoundingClientRect()
+    const pxW = Math.max(1, rect.width)
+
+    if (ds.mode === 'start') {
+      const next = Math.min(secFromClientX(e.clientX), Math.max(0, clipEnd - 1))
+      setClipStart(next)
+      seekPreviewTo(next)
+    } else if (ds.mode === 'end') {
+      const next = Math.max(secFromClientX(e.clientX), Math.min(totalDur, clipStart + 1))
+      setClipEnd(next)
+      seekPreviewTo(next)
+    } else if (ds.mode === 'window') {
+      const deltaSec = Math.round(((e.clientX - ds.anchorX) / pxW) * totalDur)
+      const span = Math.max(1, ds.initEnd - ds.initStart)
+      const nextStart = Math.max(0, Math.min(totalDur - span, ds.initStart + deltaSec))
+      setClipStart(nextStart)
+      setClipEnd(nextStart + span)
+      seekPreviewTo(nextStart)
+    } else {
+      seekPreviewTo(secFromClientX(e.clientX))
+    }
+  }
+
+  const handleTimelinePointerUp = (e: React.PointerEvent<HTMLElement>) => {
+    if (!dragStateRef.current) return
+    dragStateRef.current = null
+    setActiveDragMode(null)
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    }
+  }
+
+  const handlePasteUrl = async () => {
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text?.trim()) {
+        setUrl(text.trim())
+      }
+    } catch (_) {}
+  }
 
   return (
     <div className="mx-auto flex w-full max-w-[1320px] flex-col gap-6 px-8 py-6">
@@ -273,7 +369,7 @@ export function CaptureWorkspace({
         }}
       >
         <div
-          className="flex h-10 flex-1 items-center gap-2.5 rounded-lg border px-3"
+          className="flex h-10 flex-1 items-center gap-2 rounded-lg border px-3"
           style={{
             backgroundColor: 'var(--md-surface-high)',
             borderColor: 'var(--md-outline-variant)',
@@ -291,18 +387,40 @@ export function CaptureWorkspace({
             className="w-full bg-transparent text-[13px] outline-none"
             style={{ color: 'var(--md-on-surface)' }}
           />
+          {url ? (
+            <button
+              type="button"
+              onClick={() => setUrl('')}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md hover:bg-[var(--md-surface-highest)]"
+              style={{ color: 'var(--md-on-surface-muted)' }}
+              title="URLをクリア"
+            >
+              <X size={13} strokeWidth={1.5} />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handlePasteUrl}
+              className="flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium hover:bg-[var(--md-surface-highest)]"
+              style={{ color: 'var(--md-on-surface-variant)' }}
+              title="クリップボードから貼り付け"
+            >
+              <ClipboardPaste size={12} strokeWidth={1.5} />
+              <span>貼付</span>
+            </button>
+          )}
         </div>
         <button
           type="button"
           onClick={handleProbe}
           disabled={probing || !url.trim()}
-          className="ease-studio flex h-10 items-center gap-2 rounded-lg px-5 text-[13px] font-medium transition-opacity duration-150 disabled:opacity-45"
+          className="ease-studio flex h-10 items-center gap-2 rounded-lg px-5 text-[13px] font-medium transition-[opacity,transform] duration-150 active:scale-[0.98] disabled:opacity-45"
           style={{
             backgroundColor: 'var(--md-primary)',
             color: 'var(--md-on-primary)',
           }}
         >
-          {probing ? <Loader2 size={16} className="animate-spin" /> : <Film size={16} strokeWidth={1.5} />}
+          {probing ? <Loader2 size={16} strokeWidth={1.5} className="animate-spin" /> : <Film size={16} strokeWidth={1.5} />}
           <span>{probing ? '解析中...' : 'URLを解析'}</span>
         </button>
       </div>
@@ -500,12 +618,40 @@ export function CaptureWorkspace({
                     </div>
 
                     {showRangePreview && (
-                      <>
+                      <div
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+                          if (e.code === 'Space') {
+                            e.preventDefault()
+                            togglePlayPreview()
+                          } else if (e.key === 'i' || e.key === 'I') {
+                            e.preventDefault()
+                            setFromPreviewTime('start')
+                          } else if (e.key === 'o' || e.key === 'O') {
+                            e.preventDefault()
+                            setFromPreviewTime('end')
+                          } else if (e.key === 'ArrowLeft') {
+                            e.preventDefault()
+                            stepPreview(e.shiftKey ? -10 : -1)
+                          } else if (e.key === 'ArrowRight') {
+                            e.preventDefault()
+                            stepPreview(e.shiftKey ? 10 : 1)
+                          }
+                        }}
+                        className="flex flex-col gap-3 rounded-lg outline-none"
+                      >
                         <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
                           <video
                             ref={clipVideoRef}
                             controls
                             preload="metadata"
+                            onLoadedMetadata={() => setPreviewLoading(false)}
+                            onCanPlay={() => setPreviewLoading(false)}
+                            onError={() => {
+                              setPreviewLoading(false)
+                              setPreviewError('プレビュー映像を読み込めませんでした（下の時刻指定で切り抜き可能）')
+                            }}
                             onPlay={() => setPreviewPlaying(true)}
                             onPause={() => setPreviewPlaying(false)}
                             onTimeUpdate={(e) => {
@@ -518,6 +664,28 @@ export function CaptureWorkspace({
                             }}
                             className="h-full w-full object-contain"
                           />
+                          {previewLoading && !previewError && (
+                            <div
+                              className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2"
+                              style={{ backgroundColor: 'rgba(15, 15, 16, 0.72)' }}
+                            >
+                              <Loader2 size={20} strokeWidth={1.5} className="animate-spin" style={{ color: 'var(--md-primary)' }} />
+                              <span className="text-[11px]" style={{ color: '#a1a1a6' }}>
+                                プレビューストリームを読み込み中...
+                              </span>
+                            </div>
+                          )}
+                          {previewError && (
+                            <div
+                              className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-6 text-center"
+                              style={{ backgroundColor: 'rgba(15, 15, 16, 0.85)' }}
+                            >
+                              <AlertCircle size={18} strokeWidth={1.5} style={{ color: 'var(--md-warning)' }} />
+                              <span className="text-[12px]" style={{ color: '#ededed' }}>
+                                {previewError}
+                              </span>
+                            </div>
+                          )}
                           <div
                             className="font-mono-tabular pointer-events-none absolute top-2.5 left-2.5 flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px]"
                             style={{ backgroundColor: 'rgba(15,15,16,0.78)', color: '#ededed' }}
@@ -529,61 +697,92 @@ export function CaptureWorkspace({
                           </div>
                         </div>
 
-                        {/* Unified Dual-Handle Timeline Scrubber */}
+                        {/* Pointer-Capture NLE Dual-Handle Timeline Scrubber */}
                         {totalDur > 1 && (
-                          <div className="flex flex-col gap-1.5 px-1">
-                            <div className="relative flex h-8 items-center">
-                              {/* Track Rail */}
+                          <div className="flex flex-col gap-1 px-1">
+                            <div
+                              ref={timelineTrackRef}
+                              onPointerDown={(e) => handleTimelinePointerDown('playhead', e)}
+                              onPointerMove={handleTimelinePointerMove}
+                              onPointerUp={handleTimelinePointerUp}
+                              onPointerCancel={handleTimelinePointerUp}
+                              className="relative flex h-9 cursor-pointer items-center touch-none select-none"
+                            >
+                              {/* Base Rail */}
                               <div
-                                className="h-2 w-full rounded-full"
+                                className="h-2.5 w-full rounded-full"
                                 style={{ backgroundColor: 'var(--md-surface-highest)' }}
                               />
-                              {/* Active Selected Span */}
+
+                              {/* Selected Range Bar (Draggable window slip) */}
                               <div
-                                className="pointer-events-none absolute h-2 rounded-full"
+                                onPointerDown={(e) => handleTimelinePointerDown('window', e)}
+                                onPointerMove={handleTimelinePointerMove}
+                                onPointerUp={handleTimelinePointerUp}
+                                onPointerCancel={handleTimelinePointerUp}
+                                title="選択区間をドラッグして丸ごとスライド移動"
+                                className="absolute h-2.5 cursor-grab rounded-full active:cursor-grabbing"
                                 style={{
                                   left: `${(clipStart / totalDur) * 100}%`,
                                   width: `${Math.max(1, ((clipEnd - clipStart) / totalDur) * 100)}%`,
-                                  backgroundColor: 'var(--md-primary)',
-                                  opacity: 0.85,
+                                  backgroundColor: activeDragMode === 'window' ? 'var(--md-primary)' : 'rgba(217, 72, 65, 0.85)',
                                 }}
                               />
-                              {/* Real-time Playhead Marker */}
+
+                              {/* Playhead Needle */}
                               <div
-                                className="pointer-events-none absolute top-0.5 bottom-0.5 z-10 w-0.5 rounded-full"
+                                className="pointer-events-none absolute top-1 bottom-1 z-10 w-0.5 rounded-full"
                                 style={{
                                   left: `${Math.max(0, Math.min(100, (previewCurrentSec / totalDur) * 100))}%`,
                                   backgroundColor: '#fafafa',
-                                  boxShadow: '0 0 0 1px rgba(0,0,0,0.45)',
                                 }}
                               />
-                              {/* Layered Dual Range Inputs */}
-                              <input
-                                type="range"
+
+                              {/* IN Grip Handle */}
+                              <button
+                                type="button"
                                 aria-label="切り抜き開始位置"
-                                min={0}
-                                max={Math.max(1, totalDur - 1)}
-                                value={clipStart}
-                                onChange={(e) => {
-                                  const v = Math.min(Number(e.target.value), Math.max(0, clipEnd - 1))
-                                  setClipStart(v)
-                                  seekPreviewTo(v)
+                                onPointerDown={(e) => handleTimelinePointerDown('start', e)}
+                                onPointerMove={handleTimelinePointerMove}
+                                onPointerUp={handleTimelinePointerUp}
+                                onPointerCancel={handleTimelinePointerUp}
+                                className="absolute z-20 flex h-7 w-3.5 -translate-x-1/2 cursor-ew-resize items-center justify-center rounded border-2 border-[#fafafa]"
+                                style={{
+                                  left: `${(clipStart / totalDur) * 100}%`,
+                                  backgroundColor: 'var(--md-primary)',
                                 }}
-                                className="trim-range-input z-20"
-                              />
-                              <input
-                                type="range"
+                                title={`開始位置 ${formatDuration(clipStart)}`}
+                              >
+                                <span className="h-3 w-0.5 rounded-full bg-[#fafafa]/80" />
+                              </button>
+
+                              {/* OUT Grip Handle */}
+                              <button
+                                type="button"
                                 aria-label="切り抜き終了位置"
-                                min={1}
-                                max={totalDur}
-                                value={clipEnd}
-                                onChange={(e) => {
-                                  const v = Math.max(Number(e.target.value), clipStart + 1)
-                                  setClipEnd(v)
-                                  seekPreviewTo(v)
+                                onPointerDown={(e) => handleTimelinePointerDown('end', e)}
+                                onPointerMove={handleTimelinePointerMove}
+                                onPointerUp={handleTimelinePointerUp}
+                                onPointerCancel={handleTimelinePointerUp}
+                                className="absolute z-20 flex h-7 w-3.5 -translate-x-1/2 cursor-ew-resize items-center justify-center rounded border-2 border-[#fafafa]"
+                                style={{
+                                  left: `${(clipEnd / totalDur) * 100}%`,
+                                  backgroundColor: '#f59c97',
                                 }}
-                                className="trim-range-input trim-end z-20"
-                              />
+                                title={`終了位置 ${formatDuration(clipEnd)}`}
+                              >
+                                <span className="h-3 w-0.5 rounded-full bg-[#141415]/80" />
+                              </button>
+                            </div>
+
+                            {/* Timecode Ruler Ticks */}
+                            <div
+                              className="font-mono-tabular flex items-center justify-between text-[10px]"
+                              style={{ color: 'var(--md-on-surface-muted)' }}
+                            >
+                              {[0, 0.25, 0.5, 0.75, 1].map((r) => (
+                                <span key={r}>{formatDuration(Math.round(totalDur * r))}</span>
+                              ))}
                             </div>
                           </div>
                         )}
@@ -599,7 +798,7 @@ export function CaptureWorkspace({
                                 key={String(lbl)}
                                 type="button"
                                 onClick={() => stepPreview(Number(delta))}
-                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px]"
+                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px] hover:bg-[var(--md-surface-highest)]"
                                 style={{
                                   backgroundColor: 'var(--md-surface-high)',
                                   borderColor: 'var(--md-outline-variant)',
@@ -619,7 +818,7 @@ export function CaptureWorkspace({
                                 color: 'var(--md-on-surface)',
                               }}
                             >
-                              {previewPlaying ? <Pause size={12} /> : <Play size={12} />}
+                              {previewPlaying ? <Pause size={12} strokeWidth={1.5} /> : <Play size={12} strokeWidth={1.5} />}
                               <span>{previewPlaying ? '停止' : '再生'}</span>
                             </button>
                             {[
@@ -630,7 +829,7 @@ export function CaptureWorkspace({
                                 key={String(lbl)}
                                 type="button"
                                 onClick={() => stepPreview(Number(delta))}
-                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px]"
+                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px] hover:bg-[var(--md-surface-highest)]"
                                 style={{
                                   backgroundColor: 'var(--md-surface-high)',
                                   borderColor: 'var(--md-outline-variant)',
@@ -646,26 +845,28 @@ export function CaptureWorkspace({
                             <button
                               type="button"
                               onClick={() => setFromPreviewTime('start')}
-                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
+                              className="flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-medium"
                               style={{
                                 backgroundColor: 'var(--md-primary-tonal)',
                                 borderColor: 'var(--md-primary)',
                                 color: 'var(--md-on-primary-tonal)',
                               }}
                             >
-                              [ ここを開始に
+                              <kbd className="studio-kbd">I</kbd>
+                              <span>ここを開始に</span>
                             </button>
                             <button
                               type="button"
                               onClick={() => setFromPreviewTime('end')}
-                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
+                              className="flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-medium"
                               style={{
                                 backgroundColor: 'var(--md-surface-high)',
                                 borderColor: 'var(--md-outline-variant)',
                                 color: 'var(--md-on-surface)',
                               }}
                             >
-                              ここを終了に ]
+                              <kbd className="studio-kbd">O</kbd>
+                              <span>ここを終了に</span>
                             </button>
                             <button
                               type="button"
@@ -689,7 +890,7 @@ export function CaptureWorkspace({
                                 color: 'var(--md-on-surface-variant)',
                               }}
                             >
-                              末尾確認
+                              末尾3秒
                             </button>
                             <button
                               type="button"
@@ -701,12 +902,12 @@ export function CaptureWorkspace({
                                 color: loopSegment ? 'var(--md-on-primary-tonal)' : 'var(--md-on-surface-muted)',
                               }}
                             >
-                              <Repeat size={11} strokeWidth={1.6} />
+                              <Repeat size={11} strokeWidth={1.5} />
                               <span>ループ</span>
                             </button>
                           </div>
                         </div>
-                      </>
+                      </div>
                     )}
                   </div>
                 ) : (
@@ -1121,7 +1322,7 @@ export function CaptureWorkspace({
                 color: 'var(--md-on-primary)',
               }}
             >
-              {submitting ? <Loader2 size={17} className="animate-spin" /> : <Plus size={17} strokeWidth={1.8} />}
+              {submitting ? <Loader2 size={17} strokeWidth={1.5} className="animate-spin" /> : <Plus size={17} strokeWidth={1.5} />}
               <span>ダウンロード＆合成キューに追加</span>
             </button>
           </div>

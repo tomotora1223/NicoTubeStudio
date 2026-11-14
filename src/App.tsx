@@ -318,6 +318,8 @@ export default function App() {
         onSelectTab={setActiveTab}
         activeJobCount={activeJobCount}
         authStatus={authStatus}
+        encoders={encoders}
+        appVersion={appUpdateState?.version || '0.2.3'}
       />
 
       <main className="min-w-0 flex-1 overflow-y-auto">

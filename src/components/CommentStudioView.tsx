@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   ChevronRight,
   Compass,
@@ -88,11 +88,17 @@ export function CommentStudioView({
   const [newPresetName, setNewPresetName] = useState('')
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
   const [ngWordInput, setNgWordInput] = useState('')
+  const toastTimerRef = useRef<number | null>(null)
 
   const activePreset = useMemo(
     () => presets.find((p) => p.id === activePresetId),
     [presets, activePresetId]
   )
+
+  const hasUnsavedChanges = useMemo(() => {
+    if (!activePreset) return false
+    return JSON.stringify(normalizeCommentStyle(activePreset.config)) !== JSON.stringify(normalizeCommentStyle(styleConfig))
+  }, [activePreset, styleConfig])
 
   const setField = <K extends keyof CommentStyleConfig>(key: K, value: CommentStyleConfig[K]) => {
     onChangeStyle({ ...styleConfig, [key]: value })
@@ -100,7 +106,13 @@ export function CommentStudioView({
 
   const showToast = (msg: string) => {
     setSaveNotice(msg)
-    setTimeout(() => setSaveNotice(null), 2400)
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current)
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setSaveNotice(null)
+      toastTimerRef.current = null
+    }, 2400)
   }
 
   const handleSavePreset = async () => {
@@ -186,6 +198,11 @@ export function CommentStudioView({
               color: 'var(--md-on-surface)',
             }}
           >
+            {activePresetId === 'custom' && (
+              <option value="custom" disabled>
+                カスタム調整（みんなのスタイル）
+              </option>
+            )}
             {presets.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
@@ -194,7 +211,19 @@ export function CommentStudioView({
             ))}
           </select>
 
-          {!activePreset?.is_builtin && (
+          {hasUnsavedChanges && (
+            <span
+              className="rounded-md px-2 py-0.5 text-[11px] font-medium"
+              style={{
+                backgroundColor: 'rgba(229, 169, 60, 0.14)',
+                color: 'var(--md-warning)',
+              }}
+            >
+              未保存の変更
+            </span>
+          )}
+
+          {activePreset && !activePreset.is_builtin && (
             <button
               type="button"
               onClick={() => void handleSavePreset()}
@@ -205,7 +234,7 @@ export function CommentStudioView({
                 color: 'var(--md-on-primary-tonal)',
               }}
             >
-              <Save className="h-3.5 w-3.5" />
+              <Save className="h-3.5 w-3.5" strokeWidth={1.5} />
               上書き保存
             </button>
           )}
@@ -220,11 +249,11 @@ export function CommentStudioView({
               color: 'var(--md-on-surface)',
             }}
           >
-            <Plus className="h-3.5 w-3.5" />
+            <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
             新規保存
           </button>
 
-          {!activePreset?.is_builtin && (
+          {activePreset && !activePreset.is_builtin && (
             <button
               type="button"
               onClick={() => void onDeletePreset(activePresetId)}
@@ -236,7 +265,7 @@ export function CommentStudioView({
               }}
               title="このプリセットを削除"
             >
-              <Trash2 className="h-3.5 w-3.5" />
+              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
             </button>
           )}
 
@@ -402,7 +431,7 @@ export function CommentStudioView({
                     >
                       <div className="min-w-0">
                         <div
-                          className="truncate text-[14px] font-semibold"
+                          className="truncate text-[14px] font-medium"
                           style={{ fontFamily: `"${styleConfig.font_family}", sans-serif` }}
                         >
                           {styleConfig.font_family}
@@ -1311,7 +1340,7 @@ function InspectorCard({
       }}
     >
       <h3
-        className="flex items-center gap-1.5 text-[12px] font-semibold tracking-wide"
+        className="flex items-center gap-1.5 text-[12px] font-medium"
         style={{ color: 'var(--md-on-surface)' }}
       >
         {icon}

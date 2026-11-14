@@ -74,6 +74,40 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
         )}
       </div>
 
+      {jobs.length > 0 && (
+        <div
+          className="font-mono-tabular flex flex-wrap items-center gap-4 rounded-xl border px-4 py-2.5 text-[12px]"
+          style={{
+            backgroundColor: 'var(--md-surface-low)',
+            borderColor: 'var(--md-outline-variant)',
+            color: 'var(--md-on-surface-variant)',
+          }}
+        >
+          <span>
+            合計 <strong className="font-medium" style={{ color: 'var(--md-on-surface)' }}>{jobs.length}</strong>件
+          </span>
+          <span style={{ color: 'var(--md-outline)' }}>|</span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: 'var(--md-primary)' }} />
+            処理中 {jobs.filter((j) => j.status === 'downloading' || j.status === 'parsing_chat' || j.status === 'rendering').length}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: 'var(--md-on-surface-muted)' }} />
+            待機 {jobs.filter((j) => j.status === 'queued').length}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: 'var(--md-positive)' }} />
+            完了 {jobs.filter((j) => j.status === 'completed').length}
+          </span>
+          {jobs.some((j) => j.status === 'failed' || j.status === 'cancelled') && (
+            <span className="flex items-center gap-1.5" style={{ color: 'var(--md-negative)' }}>
+              <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: 'var(--md-negative)' }} />
+              停止/失敗 {jobs.filter((j) => j.status === 'failed' || j.status === 'cancelled').length}
+            </span>
+          )}
+        </div>
+      )}
+
       {jobs.length === 0 ? (
         <div
           className="flex h-64 flex-col items-center justify-center gap-2 rounded-2xl border text-center"
@@ -312,6 +346,17 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
                                   }}
                                 >
                                   {extBadge}
+                                </span>
+                              )}
+                              {f === primaryFile && (
+                                <span
+                                  className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                                  style={{
+                                    backgroundColor: 'var(--md-primary-tonal)',
+                                    color: 'var(--md-on-primary-tonal)',
+                                  }}
+                                >
+                                  主出力
                                 </span>
                               )}
                               <span className="font-mono-tabular truncate" title={f}>

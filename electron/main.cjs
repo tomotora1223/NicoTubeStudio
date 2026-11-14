@@ -3,7 +3,7 @@ const { autoUpdater } = require('electron-updater')
 const path = require('path')
 const fs = require('fs')
 const net = require('net')
-const { spawn } = require('child_process')
+const { spawn, spawnSync } = require('child_process')
 const http = require('http')
 
 // Improve Google Sign-In compatibility inside Electron BrowserWindow
@@ -34,7 +34,12 @@ function findFreePort(startPort = 18742) {
 function waitForBackend(port, retries = 45) {
   return new Promise((resolve, reject) => {
     const attempt = (left) => {
-      const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
+      if (backendProcess && backendProcess.exitCode !== null) {
+        reject(new Error(`Backend exited prematurely (code ${backendProcess.exitCode})`))
+        return
+      }
+      const req = http.get(`http://127.0.0.1:${port}/api/health`, { timeout: 1500 }, (res) => {
+        res.resume()
         if (res.statusCode === 200) {
           resolve(true)
         } else if (left > 0) {
@@ -42,6 +47,9 @@ function waitForBackend(port, retries = 45) {
         } else {
           reject(new Error('Backend health check failed'))
         }
+      })
+      req.on('timeout', () => {
+        req.destroy()
       })
       req.on('error', () => {
         if (left > 0) {
@@ -104,14 +112,19 @@ async function startBackend() {
 
 function stopBackend() {
   if (backendProcess && !backendProcess.killed) {
+    const pid = backendProcess.pid
+    backendProcess = null
+    if (!pid) return
     try {
       if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(backendProcess.pid), '/f', '/t'], { windowsHide: true })
+        spawnSync('taskkill', ['/pid', String(pid), '/f', '/t'], {
+          windowsHide: true,
+          timeout: 3000,
+        })
       } else {
-        backendProcess.kill('SIGTERM')
+        process.kill(pid, 'SIGTERM')
       }
     } catch (_) {}
-    backendProcess = null
   }
 }
 

@@ -16,6 +16,7 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react'
 import { DanmakuCanvas } from './DanmakuCanvas'
 import { api } from '../lib/api'
@@ -113,6 +114,8 @@ export function CommunityStylesView({
   const [statusNotice, setStatusNotice] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [savingPreset, setSavingPreset] = useState(false)
+  const copyTimerRef = useRef<number | null>(null)
+  const noticeTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (defaultAuthorName && !pubAuthor) {
@@ -176,8 +179,12 @@ export function CommunityStylesView({
 
   const notify = (msg: string) => {
     setStatusNotice(msg)
-    window.setTimeout(() => {
-      setStatusNotice((cur) => (cur === msg ? null : cur))
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current)
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      setStatusNotice(null)
+      noticeTimerRef.current = null
     }, 3200)
   }
 
@@ -196,7 +203,13 @@ export function CommunityStylesView({
     await navigator.clipboard.writeText(code)
     setCopiedId(idKey)
     notify(`「${name}」の共有コードをコピーしました`)
-    window.setTimeout(() => setCopiedId(null), 1600)
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current)
+    }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedId(null)
+      copyTimerRef.current = null
+    }, 1600)
   }
 
   const handleExportJsonFile = (name: string, cfg: CommentStyleConfig) => {
@@ -605,22 +618,48 @@ export function CommunityStylesView({
                   borderColor: 'var(--md-outline-variant)',
                 }}
               >
-                <div
-                  className="flex h-9 items-center gap-2 rounded-lg border px-3"
-                  style={{
-                    backgroundColor: 'var(--md-surface)',
-                    borderColor: 'var(--md-outline-variant)',
-                  }}
-                >
-                  <Search className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--md-on-surface-muted)' }} strokeWidth={1.5} />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="スタイル名・タグ・制作者で検索"
-                    className="w-full bg-transparent text-[12px] outline-none"
-                    style={{ color: 'var(--md-on-surface)' }}
-                  />
+                <div className="flex items-center gap-2">
+                  <div
+                    className="flex h-9 flex-1 items-center gap-2 rounded-lg border px-3"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                    }}
+                  >
+                    <Search className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--md-on-surface-muted)' }} strokeWidth={1.5} />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="スタイル名・タグ・制作者で検索"
+                      className="w-full bg-transparent text-[12px] outline-none"
+                      style={{ color: 'var(--md-on-surface)' }}
+                    />
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setSearchQuery('')}
+                        className="rounded p-0.5 hover:bg-[var(--md-surface-high)]"
+                        style={{ color: 'var(--md-on-surface-muted)' }}
+                        title="検索をクリア"
+                      >
+                        <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewTarget(previewTarget === 'current' ? (styles[0]?.id || 'current') : 'current')}
+                    className="h-9 shrink-0 rounded-lg border px-2.5 text-[11px] font-medium transition-colors duration-150"
+                    style={{
+                      backgroundColor: previewTarget === 'current' ? 'var(--md-primary-tonal)' : 'var(--md-surface)',
+                      borderColor: previewTarget === 'current' ? 'var(--md-primary)' : 'var(--md-outline-variant)',
+                      color: previewTarget === 'current' ? 'var(--md-on-primary-tonal)' : 'var(--md-on-surface-variant)',
+                    }}
+                    title="現在スタジオで編集中の設定と比べられます"
+                  >
+                    自分の設定を試聴
+                  </button>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {allTags.map((tag) => {

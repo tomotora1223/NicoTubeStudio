@@ -83,7 +83,7 @@ function FontPreviewRow({
             </span>
           )}
         </div>
-        {selected && <Check size={15} strokeWidth={2} style={{ color: 'var(--md-primary)' }} />}
+        {selected && <Check size={15} strokeWidth={1.5} style={{ color: 'var(--md-primary)' }} />}
       </div>
 
       <div
@@ -183,7 +183,7 @@ export function FontPickerModal({
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Type size={17} strokeWidth={1.6} style={{ color: 'var(--md-primary)' }} />
+            <Type size={17} strokeWidth={1.5} style={{ color: 'var(--md-primary)' }} />
             <div>
               <div className="text-[15px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
                 システムフォント一覧・日本語プレビュー

@@ -454,6 +454,8 @@ def resolve_ffmpeg_video_args(
     avail = probe.encoders_by_codec.get(codec, [])
 
     def pick(prefix_map: dict[str, str], fallback: str) -> str:
+        if chosen_hw == "cpu":
+            return fallback
         target = prefix_map.get(chosen_hw)
         if target and target in avail:
             return target

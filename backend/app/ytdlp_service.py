@@ -689,14 +689,16 @@ def transcode_video_only(
     src_ext = Path(source_video).suffix.lower().lstrip(".")
     has_trim = clip_offset_sec > 0 or (clip_duration_sec is not None and clip_duration_sec > 0)
     src_vcodec = get_video_codec(source_video)
+    src_acodec = get_audio_codec(source_video)
     codec_matches = (
         (encode.codec == "h264" and src_vcodec in ("h264", "avc1"))
         or (encode.codec == "h265" and src_vcodec in ("hevc", "h265", "hvc1", "hev1"))
         or (encode.codec == "av1" and src_vcodec in ("av1", "av01"))
     )
+    audio_copy_ok = (encode.container == "mkv") or src_acodec in ("aac", "mp3", "ac3", "eac3", "alac", "flac", "")
     container_args = ["-movflags", "+faststart"] if encode.container == "mp4" else []
 
-    if src_ext == encode.container and codec_matches and encode.max_fps == 0 and not has_trim:
+    if src_ext == encode.container and codec_matches and audio_copy_ok and encode.max_fps == 0 and not has_trim:
         cmd = [
             ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
             "-i", source_video, "-c", "copy", *container_args, output_video,
@@ -722,7 +724,7 @@ def transcode_video_only(
             shutil.copy2(source_video, output_video)
         return
 
-    _, _, fps, meta_dur = get_video_metadata(source_video)
+    src_w, src_h, fps, meta_dur = get_video_metadata(source_video)
     target_dur = clip_duration_sec if (clip_duration_sec and clip_duration_sec > 0) else max(0.5, meta_dur - clip_offset_sec)
     if encode.max_fps > 0 and fps > encode.max_fps:
         fps = float(encode.max_fps)
@@ -737,9 +739,13 @@ def transcode_video_only(
     if clip_duration_sec is not None and clip_duration_sec > 0:
         clip_in_args += ["-t", f"{clip_duration_sec:.3f}"]
 
-    vf_args = ["-vf", f"fps={encode.max_fps}"] if encode.max_fps > 0 else []
-    src_audio_codec = get_audio_codec(source_video)
-    can_copy_audio = (encode.container == "mkv" or src_audio_codec == "aac") and clip_offset_sec <= 0.05
+    vf_parts: list[str] = []
+    if encode.max_fps > 0:
+        vf_parts.append(f"fps={encode.max_fps}")
+    if src_w % 2 != 0 or src_h % 2 != 0:
+        vf_parts.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+    vf_args = ["-vf", ",".join(vf_parts)] if vf_parts else []
+    can_copy_audio = (encode.container == "mkv" or src_acodec == "aac") and clip_offset_sec <= 0.05
     audio_args = ["-c:a", "copy"] if can_copy_audio else ["-c:a", "aac", "-b:a", "192k"]
 
     def _run_transcode(in_hw_args: list[str]) -> tuple[int, str]:
