@@ -306,6 +306,37 @@ def get_video_metadata(video_path: str) -> tuple[int, int, float, float]:
     return width, height, fps, duration
 
 
+def get_audio_codec(video_path: str) -> str:
+    """Return the first audio stream codec_name (lowercase), or empty string."""
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return ""
+    cmd = [
+        ffprobe,
+        "-v",
+        "quiet",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return (res.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def get_media_start_time(video_path: str) -> float:
     """Return container format start_time in seconds (useful after -c copy -copyts)."""
     ffprobe = find_ffprobe()
@@ -365,30 +396,40 @@ def resolve_ffmpeg_video_args(
         enc = pick({"nvenc": "av1_nvenc", "qsv": "av1_qsv", "amf": "av1_amf"}, "libsvtav1")
 
     if "nvenc" in enc:
-        p_map = {"fast": "p3", "medium": "p5", "slow": "p6"}
+        p_map = {"fast": "p1", "medium": "p4", "slow": "p6"}
+        extra = (
+            ["-rc-lookahead", "0", "-spatial-aq", "0", "-multipass", "disabled"]
+            if preset_speed == "fast"
+            else []
+        )
         return [
             "-c:v", enc,
-            "-preset", p_map.get(preset_speed, "p5"),
+            "-preset", p_map.get(preset_speed, "p4"),
             "-rc", "vbr",
             "-cq", str(quality_cq),
             "-b:v", "0",
+            *extra,
             "-pix_fmt", "yuv420p",
         ]
     if "qsv" in enc:
-        p_map = {"fast": "veryfast", "medium": "medium", "slow": "veryslow"}
+        p_map = {"fast": "veryfast", "medium": "faster", "slow": "medium"}
+        extra = ["-look_ahead", "0"] if preset_speed == "fast" else []
         return [
             "-c:v", enc,
-            "-preset", p_map.get(preset_speed, "medium"),
+            "-preset", p_map.get(preset_speed, "faster"),
             "-global_quality", str(quality_cq),
+            *extra,
             "-pix_fmt", "yuv420p",
         ]
     if "amf" in enc:
         q_map = {"fast": "speed", "medium": "balanced", "slow": "quality"}
+        extra = ["-preanalysis", "false"] if preset_speed == "fast" else []
         return [
             "-c:v", enc,
             "-quality", q_map.get(preset_speed, "balanced"),
             "-rc", "qvbr",
             "-qvbr_quality_level", str(quality_cq),
+            *extra,
             "-pix_fmt", "yuv420p",
         ]
 

@@ -192,6 +192,7 @@ export interface EncodeConfig {
   quality_cq: number
   preset_speed: 'fast' | 'medium' | 'slow'
   container: 'mp4' | 'mkv'
+  download_thumbnail?: boolean
 }
 
 export interface JobCreateRequest {
@@ -365,6 +366,7 @@ export const DEFAULT_ENCODE_CONFIG: EncodeConfig = {
   quality_cq: 20,
   preset_speed: 'medium',
   container: 'mp4',
+  download_thumbnail: false,
 }
 
 declare global {

@@ -1,29 +1,21 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import {
-  Check,
   ChevronRight,
-  Copy,
-  Download,
-  ExternalLink,
-  Globe,
+  Compass,
   Layers,
   Maximize2,
   MoveHorizontal,
   Palette,
   Plus,
-  RefreshCw,
   RotateCcw,
   Save,
-  Share2,
   Sparkles,
   Trash2,
   Type,
-  Upload,
   Users,
 } from 'lucide-react'
 import { DanmakuCanvas } from './DanmakuCanvas'
 import { FontPickerModal } from './FontPickerModal'
-import { api } from '../lib/api'
 import {
   DEFAULT_SUPERCHAT_TIER_COLORS,
   SUPERCHAT_TIER_LABELS,
@@ -33,7 +25,6 @@ import {
   type EventDisplayMode,
   type PinMode,
   type Preset,
-  type SharedStyleEntry,
   type SuperChatMode,
   type SuperChatTierKey,
 } from '../types/studio'
@@ -48,17 +39,17 @@ interface CommentStudioViewProps {
   onUpdatePreset: (id: string, name: string, description: string, cfg: CommentStyleConfig) => Promise<void>
   onDeletePreset: (id: string) => Promise<void>
   onOpenFullscreenPreview: () => void
+  onOpenCommunityGallery?: () => void
   thumbnailUrl?: string | null
 }
 
-type StudioSubTab = 'typography' | 'motion' | 'roles' | 'youtube' | 'share'
+type StudioSubTab = 'typography' | 'motion' | 'roles' | 'youtube'
 
 const SUB_TABS: Array<{ id: StudioSubTab; label: string; icon: typeof Type }> = [
   { id: 'typography', label: '文字・装飾', icon: Type },
   { id: 'motion', label: '配置・弾幕', icon: MoveHorizontal },
   { id: 'roles', label: 'ユーザー種別', icon: Users },
-  { id: 'youtube', label: 'YouTube演出', icon: Sparkles },
-  { id: 'share', label: '共有・サーバー', icon: Share2 },
+  { id: 'youtube', label: 'チャット演出', icon: Sparkles },
 ]
 
 const FONT_WEIGHT_OPTIONS = [
@@ -78,38 +69,6 @@ const EVENT_MODE_OPTIONS: Array<{ id: EventDisplayMode; label: string }> = [
   { id: 'hide', label: '非表示' },
 ]
 
-function encodeShareCode(name: string, config: CommentStyleConfig): string {
-  const payload = JSON.stringify({ v: 1, name, config })
-  const bytes = new TextEncoder().encode(payload)
-  let binary = ''
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i])
-  }
-  return `NTS1:${btoa(binary)}`
-}
-
-function decodeShareCode(raw: string): { name: string; config: CommentStyleConfig } {
-  const trimmed = raw.trim()
-  let parsed: Record<string, unknown>
-  if (trimmed.startsWith('NTS1:')) {
-    const b64 = trimmed.slice(5).trim()
-    const binary = atob(b64)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i)
-    }
-    const text = new TextDecoder().decode(bytes)
-    parsed = JSON.parse(text) as Record<string, unknown>
-  } else {
-    parsed = JSON.parse(trimmed) as Record<string, unknown>
-  }
-  const candidate = (parsed.config ?? parsed.style ?? parsed) as Partial<CommentStyleConfig>
-  return {
-    name: typeof parsed.name === 'string' && parsed.name ? parsed.name : '共有スタイル',
-    config: normalizeCommentStyle(candidate),
-  }
-}
-
 export function CommentStudioView({
   styleConfig,
   onChangeStyle,
@@ -120,6 +79,7 @@ export function CommentStudioView({
   onUpdatePreset,
   onDeletePreset,
   onOpenFullscreenPreview,
+  onOpenCommunityGallery,
   thumbnailUrl,
 }: CommentStudioViewProps) {
   const [subTab, setSubTab] = useState<StudioSubTab>('typography')
@@ -128,18 +88,6 @@ export function CommentStudioView({
   const [newPresetName, setNewPresetName] = useState('')
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
   const [ngWordInput, setNgWordInput] = useState('')
-
-  const [sharedStyles, setSharedStyles] = useState<SharedStyleEntry[]>([])
-  const [sharedLoading, setSharedLoading] = useState(false)
-  const [shareName, setShareName] = useState('')
-  const [shareAuthor, setShareAuthor] = useState('')
-  const [shareDesc, setShareDesc] = useState('')
-  const [shareCodeInput, setShareCodeInput] = useState('')
-  const [shareUrlInput, setShareUrlInput] = useState('')
-  const [styleServerUrl, setStyleServerUrl] = useState('')
-  const [shareStatus, setShareStatus] = useState<string | null>(null)
-  const [copiedCode, setCopiedCode] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const activePreset = useMemo(
     () => presets.find((p) => p.id === activePresetId),
@@ -154,28 +102,6 @@ export function CommentStudioView({
     setSaveNotice(msg)
     setTimeout(() => setSaveNotice(null), 2400)
   }
-
-  const refreshSharedLibrary = async () => {
-    setSharedLoading(true)
-    try {
-      const [items, settings] = await Promise.all([api.getSharedStyles(), api.getSettings()])
-      setSharedStyles(items)
-      setStyleServerUrl(settings.style_server_url || '')
-    } catch (err) {
-      setShareStatus(err instanceof Error ? err.message : '共有スタイルの取得に失敗しました')
-    } finally {
-      setSharedLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    if (subTab === 'share') {
-      void refreshSharedLibrary()
-      if (!shareName) {
-        setShareName(activePreset?.name || 'マイカスタムスタイル')
-      }
-    }
-  }, [subTab])
 
   const handleSavePreset = async () => {
     if (!activePreset || activePreset.is_builtin) return
@@ -199,94 +125,6 @@ export function CommentStudioView({
       setField('ng_words', [...styleConfig.ng_words, word])
     }
     setNgWordInput('')
-  }
-
-  const handleExportJson = () => {
-    const baseName = (activePreset?.name || 'nicotube-style').replace(/[\\/:*?"<>|]/g, '_')
-    const payload = {
-      schema: 'nicotube-style-v1',
-      name: activePreset?.name || 'カスタムスタイル',
-      exported_at: new Date().toISOString(),
-      config: styleConfig,
-    }
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${baseName}.nicostyle.json`
-    a.click()
-    URL.revokeObjectURL(url)
-    setShareStatus('スタイルファイル (.nicostyle.json) を書き出しました')
-  }
-
-  const handleImportFile = async (file: File) => {
-    try {
-      const text = await file.text()
-      const decoded = decodeShareCode(text)
-      onChangeStyle(decoded.config)
-      setShareStatus(`「${decoded.name}」のスタイルを読み込みました`)
-    } catch {
-      setShareStatus('JSON ファイルの形式が正しくありません')
-    }
-  }
-
-  const handleCopyShareCode = async () => {
-    const code = encodeShareCode(activePreset?.name || 'NicoTubeスタイル', styleConfig)
-    await navigator.clipboard.writeText(code)
-    setCopiedCode(true)
-    setShareStatus('共有コードをクリップボードにコピーしました')
-    setTimeout(() => setCopiedCode(false), 2000)
-  }
-
-  const handleApplyShareCode = () => {
-    if (!shareCodeInput.trim()) return
-    try {
-      const decoded = decodeShareCode(shareCodeInput)
-      onChangeStyle(decoded.config)
-      setShareStatus(`共有コード「${decoded.name}」を適用しました`)
-    } catch {
-      setShareStatus('共有コードの解析に失敗しました（NTS1: または JSON を指定してください）')
-    }
-  }
-
-  const handleImportFromUrl = async () => {
-    const target = shareUrlInput.trim()
-    if (!target) return
-    try {
-      const res = await api.importStyleFromUrl(target)
-      onChangeStyle(normalizeCommentStyle(res.config))
-      setShareStatus(`URL から「${res.name}」を読み込みました`)
-    } catch (err) {
-      setShareStatus(err instanceof Error ? err.message : 'URL からの読み込みに失敗しました')
-    }
-  }
-
-  const handlePublishStyle = async () => {
-    const name = shareName.trim() || activePreset?.name || '共有スタイル'
-    try {
-      await api.publishSharedStyle({
-        name,
-        author: shareAuthor.trim() || '匿名ユーザー',
-        description: shareDesc.trim(),
-        config: styleConfig,
-      })
-      setShareStatus(`「${name}」を共有ライブラリへ公開しました`)
-      setShareDesc('')
-      await refreshSharedLibrary()
-    } catch (err) {
-      setShareStatus(err instanceof Error ? err.message : '共有ライブラリへの保存に失敗しました')
-    }
-  }
-
-  const handleSaveServerUrl = async () => {
-    try {
-      const cur = await api.getSettings()
-      await api.updateSettings({ ...cur, style_server_url: styleServerUrl.trim() })
-      setShareStatus('共有サーバー URL を保存しました')
-      await refreshSharedLibrary()
-    } catch (err) {
-      setShareStatus(err instanceof Error ? err.message : 'サーバー設定の保存に失敗しました')
-    }
   }
 
   const renderTierColorRow = (tier: { key: SuperChatTierKey; label: string; sampleAmount: string }) => {
@@ -495,15 +333,18 @@ export function CommentStudioView({
             }}
           >
             <span>右側のタブで設定を変えるとリアルタイムに弾幕へ反映されます</span>
-            <button
-              type="button"
-              onClick={() => setSubTab('share')}
-              className="flex items-center gap-1 font-medium"
-              style={{ color: 'var(--md-primary)' }}
-            >
-              <Share2 className="h-3.5 w-3.5" />
-              スタイルを書き出し / 共有
-            </button>
+            {onOpenCommunityGallery && (
+              <button
+                type="button"
+                onClick={onOpenCommunityGallery}
+                className="flex items-center gap-1.5 font-medium"
+                style={{ color: 'var(--md-primary)' }}
+              >
+                <Compass className="h-3.5 w-3.5" strokeWidth={1.5} />
+                <span>みんなのスタイルで公開・書き出し</span>
+                <ChevronRight className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </button>
+            )}
           </div>
         </div>
 
@@ -515,7 +356,7 @@ export function CommentStudioView({
           }}
         >
           <div
-            className="grid grid-cols-5 border-b"
+            className="grid grid-cols-4 border-b"
             style={{ borderColor: 'var(--md-outline-variant)' }}
           >
             {SUB_TABS.map((t) => {
@@ -1438,308 +1279,6 @@ export function CommentStudioView({
               </>
             )}
 
-            {/* TAB 5: STYLE SHARING & REMOTE SERVER */}
-            {subTab === 'share' && (
-              <>
-                {shareStatus && (
-                  <div
-                    className="rounded-xl border px-3 py-2 text-[12px]"
-                    style={{
-                      backgroundColor: 'var(--md-primary-tonal)',
-                      borderColor: 'var(--md-primary)',
-                      color: 'var(--md-on-primary-tonal)',
-                    }}
-                  >
-                    {shareStatus}
-                  </div>
-                )}
-
-                <InspectorCard title="ファイル書き出し・読み込み (.nicostyle.json)" icon={<Share2 className="h-3.5 w-3.5" />}>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={handleExportJson}
-                      className="flex h-9 items-center justify-center gap-1.5 rounded-xl border text-[12px] font-medium"
-                      style={{
-                        backgroundColor: 'var(--md-primary)',
-                        borderColor: 'var(--md-primary)',
-                        color: 'var(--md-on-primary)',
-                      }}
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      JSON 書き出し
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="flex h-9 items-center justify-center gap-1.5 rounded-xl border text-[12px] font-medium"
-                      style={{
-                        backgroundColor: 'var(--md-surface)',
-                        borderColor: 'var(--md-outline-variant)',
-                        color: 'var(--md-on-surface)',
-                      }}
-                    >
-                      <Upload className="h-3.5 w-3.5" />
-                      JSON 読み込み
-                    </button>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept=".json,.nicostyle.json"
-                      className="hidden"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0]
-                        if (f) void handleImportFile(f)
-                        e.target.value = ''
-                      }}
-                    />
-                  </div>
-
-                  <div className="space-y-2 border-t pt-2.5" style={{ borderColor: 'var(--md-outline-variant)' }}>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px]" style={{ color: 'var(--md-on-surface-variant)' }}>
-                        テキスト共有コード (Discord / X で共有向け)
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => void handleCopyShareCode()}
-                        className="flex items-center gap-1 text-[11px] font-medium"
-                        style={{ color: 'var(--md-primary)' }}
-                      >
-                        {copiedCode ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                        {copiedCode ? 'コピー済み' : 'コードをコピー'}
-                      </button>
-                    </div>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="text"
-                        value={shareCodeInput}
-                        onChange={(e) => setShareCodeInput(e.target.value)}
-                        placeholder="受け取った NTS1:... または JSON を貼り付け"
-                        className="h-8 flex-1 rounded-lg border px-2.5 text-[11px] outline-none"
-                        style={{
-                          backgroundColor: 'var(--md-surface)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={handleApplyShareCode}
-                        className="h-8 rounded-lg border px-3 text-[11px] font-medium"
-                        style={{
-                          backgroundColor: 'var(--md-surface-high)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      >
-                        適用
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5 border-t pt-2.5" style={{ borderColor: 'var(--md-outline-variant)' }}>
-                    <span className="block text-[11px]" style={{ color: 'var(--md-on-surface-variant)' }}>
-                      Web URL (.nicostyle.json / GitHub Raw) から読み込み
-                    </span>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="text"
-                        value={shareUrlInput}
-                        onChange={(e) => setShareUrlInput(e.target.value)}
-                        placeholder="https://raw.githubusercontent.com/.../style.nicostyle.json"
-                        className="h-8 flex-1 rounded-lg border px-2.5 text-[11px] outline-none"
-                        style={{
-                          backgroundColor: 'var(--md-surface)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void handleImportFromUrl()}
-                        className="flex h-8 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-medium"
-                        style={{
-                          backgroundColor: 'var(--md-surface-high)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      >
-                        <ExternalLink className="h-3 w-3" />
-                        取得
-                      </button>
-                    </div>
-                  </div>
-                </InspectorCard>
-
-                <InspectorCard title="共有サーバー接続・ライブラリ公開" icon={<Globe className="h-3.5 w-3.5" />}>
-                  <div className="space-y-1.5">
-                    <label className="block text-[11px]" style={{ color: 'var(--md-on-surface-variant)' }}>
-                      外部スタイル共有サーバー URL（未入力時はこのPC内のみに保存）
-                    </label>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="text"
-                        value={styleServerUrl}
-                        onChange={(e) => setStyleServerUrl(e.target.value)}
-                        placeholder="https://your-style-server.example.com"
-                        className="h-8 flex-1 rounded-lg border px-2.5 text-[11px] outline-none"
-                        style={{
-                          backgroundColor: 'var(--md-surface)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void handleSaveServerUrl()}
-                        className="h-8 rounded-lg border px-3 text-[11px] font-medium"
-                        style={{
-                          backgroundColor: 'var(--md-surface-high)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      >
-                        接続設定
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 border-t pt-2.5" style={{ borderColor: 'var(--md-outline-variant)' }}>
-                    <div className="text-[11px] font-medium" style={{ color: 'var(--md-on-surface-variant)' }}>
-                      現在の設定を共有ライブラリへ登録
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <input
-                        type="text"
-                        value={shareName}
-                        onChange={(e) => setShareName(e.target.value)}
-                        placeholder="スタイル名"
-                        className="h-8 rounded-lg border px-2.5 text-[12px] outline-none"
-                        style={{
-                          backgroundColor: 'var(--md-surface)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      />
-                      <input
-                        type="text"
-                        value={shareAuthor}
-                        onChange={(e) => setShareAuthor(e.target.value)}
-                        placeholder="制作者名 (任意)"
-                        className="h-8 rounded-lg border px-2.5 text-[12px] outline-none"
-                        style={{
-                          backgroundColor: 'var(--md-surface)',
-                          borderColor: 'var(--md-outline-variant)',
-                          color: 'var(--md-on-surface)',
-                        }}
-                      />
-                    </div>
-                    <input
-                      type="text"
-                      value={shareDesc}
-                      onChange={(e) => setShareDesc(e.target.value)}
-                      placeholder="ひとこと説明（例：FPS配信向けの見やすい縁取り）"
-                      className="h-8 w-full rounded-lg border px-2.5 text-[12px] outline-none"
-                      style={{
-                        backgroundColor: 'var(--md-surface)',
-                        borderColor: 'var(--md-outline-variant)',
-                        color: 'var(--md-on-surface)',
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void handlePublishStyle()}
-                      className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg text-[12px] font-medium"
-                      style={{
-                        backgroundColor: 'var(--md-primary-tonal)',
-                        color: 'var(--md-on-primary-tonal)',
-                      }}
-                    >
-                      <Share2 className="h-3.5 w-3.5" />
-                      ライブラリへ公開する
-                    </button>
-                  </div>
-
-                  <div className="space-y-2 border-t pt-2.5" style={{ borderColor: 'var(--md-outline-variant)' }}>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-medium" style={{ color: 'var(--md-on-surface-variant)' }}>
-                        登録済みスタイル ({sharedStyles.length})
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => void refreshSharedLibrary()}
-                        className="flex items-center gap-1 text-[11px]"
-                        style={{ color: 'var(--md-primary)' }}
-                      >
-                        <RefreshCw className={`h-3 w-3 ${sharedLoading ? 'animate-spin' : ''}`} />
-                        更新
-                      </button>
-                    </div>
-
-                    {sharedStyles.length === 0 ? (
-                      <div className="py-3 text-center text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                        まだ登録された共有スタイルはありません
-                      </div>
-                    ) : (
-                      <div className="space-y-1.5">
-                        {sharedStyles.map((item) => (
-                          <div
-                            key={item.id}
-                            className="flex items-center justify-between gap-2 rounded-lg border px-2.5 py-2"
-                            style={{
-                              backgroundColor: 'var(--md-surface)',
-                              borderColor: 'var(--md-outline-variant)',
-                            }}
-                          >
-                            <div className="min-w-0">
-                              <div className="truncate text-[12px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
-                                {item.name}
-                              </div>
-                              <div className="truncate text-[10px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                                {item.author} · {item.config.font_family}
-                                {item.description ? ` · ${item.description}` : ''}
-                              </div>
-                            </div>
-                            <div className="flex shrink-0 items-center gap-1">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  onChangeStyle(normalizeCommentStyle(item.config))
-                                  setShareStatus(`「${item.name}」を適用しました`)
-                                }}
-                                className="h-7 rounded-lg px-2.5 text-[11px] font-medium"
-                                style={{
-                                  backgroundColor: 'var(--md-primary-tonal)',
-                                  color: 'var(--md-on-primary-tonal)',
-                                }}
-                              >
-                                適用
-                              </button>
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  await api.deleteSharedStyle(item.id)
-                                  await refreshSharedLibrary()
-                                }}
-                                className="flex h-7 w-7 items-center justify-center rounded-lg border"
-                                style={{
-                                  borderColor: 'var(--md-outline-variant)',
-                                  color: 'var(--md-error)',
-                                }}
-                                title="削除"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </InspectorCard>
-              </>
-            )}
           </div>
         </aside>
       </div>

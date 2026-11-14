@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Check,
   Copy,
   Download,
   ExternalLink,
+  FileJson,
   Globe,
   Layers,
   Plus,
   RefreshCw,
   Search,
+  Settings2,
   Share2,
   SlidersHorizontal,
   Sparkles,
@@ -25,13 +27,17 @@ import {
 
 interface CommunityStylesViewProps {
   currentStyle: CommentStyleConfig
+  activePresetName?: string
   thumbnailUrl?: string | null
   defaultAuthorName?: string
   hasRelayServer?: boolean
   hasGithubToken?: boolean
   onApplyStyle: (config: CommentStyleConfig, openStudio?: boolean) => void
   onSaveAsPreset: (name: string, description: string, config: CommentStyleConfig) => Promise<void>
+  onGoToSettings?: () => void
 }
+
+type PanelMode = 'browse' | 'share' | 'import'
 
 function encodeShareCode(name: string, config: CommentStyleConfig): string {
   const payload = JSON.stringify({ v: 1, name, config })
@@ -43,28 +49,55 @@ function encodeShareCode(name: string, config: CommentStyleConfig): string {
   return `NTS1:${btoa(binary)}`
 }
 
+function decodeShareText(raw: string): { name: string; config: CommentStyleConfig } {
+  const trimmed = raw.trim()
+  let parsed: Record<string, unknown>
+  if (trimmed.startsWith('NTS1:')) {
+    const b64 = trimmed.slice(5).trim()
+    const binary = atob(b64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    parsed = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>
+  } else {
+    parsed = JSON.parse(trimmed) as Record<string, unknown>
+  }
+  const candidate = (parsed.config ?? parsed.style ?? parsed) as Partial<CommentStyleConfig>
+  return {
+    name: typeof parsed.name === 'string' && parsed.name ? parsed.name : 'インポートスタイル',
+    config: normalizeCommentStyle(candidate),
+  }
+}
+
 const SOURCE_LABELS: Record<string, string> = {
-  github: 'GitHub共有',
+  github: 'GitHub',
   relay: 'リレーサーバー',
-  local: 'ローカル保存',
+  local: '自分の公開履歴',
 }
 
 export function CommunityStylesView({
   currentStyle,
+  activePresetName = '現在の調整スタイル',
   thumbnailUrl,
   defaultAuthorName = '',
   hasRelayServer = false,
   hasGithubToken = false,
   onApplyStyle,
   onSaveAsPreset,
+  onGoToSettings,
 }: CommunityStylesViewProps) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [styles, setStyles] = useState<SharedStyleEntry[]>([])
   const [loading, setLoading] = useState(false)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [panelMode, setPanelMode] = useState<PanelMode>('browse')
+
+  // Preview target can either be an entry ID or 'current' (user's live studio style)
+  const [previewTarget, setPreviewTarget] = useState<string>('first')
   const [searchQuery, setSearchQuery] = useState('')
   const [activeTag, setActiveTag] = useState<string>('すべて')
-  const [actionPanel, setActionPanel] = useState<'none' | 'publish' | 'import'>('none')
 
+  // Publish form (always publishes currentStyle)
   const [pubName, setPubName] = useState('')
   const [pubAuthor, setPubAuthor] = useState(defaultAuthorName || '')
   const [pubTags, setPubTags] = useState('配信向け, 高視認性')
@@ -72,9 +105,11 @@ export function CommunityStylesView({
   const [publishing, setPublishing] = useState(false)
   const [publishResult, setPublishResult] = useState<{ message: string; url?: string } | null>(null)
 
+  // Import form (URL, NTS1 code, or .nicostyle.json)
   const [importInput, setImportInput] = useState('')
   const [importing, setImporting] = useState(false)
-  const [importedPreview, setImportedPreview] = useState<SharedStyleEntry | null>(null)
+  const [importedEntry, setImportedEntry] = useState<SharedStyleEntry | null>(null)
+
   const [statusNotice, setStatusNotice] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [savingPreset, setSavingPreset] = useState(false)
@@ -90,16 +125,17 @@ export function CommunityStylesView({
     try {
       const list = await api.getCommunityStyles(forceRefresh)
       setStyles(list)
-      setSelectedId((prev) => {
-        if (prev && list.some((s) => s.id === prev)) return prev
-        return list[0]?.id || null
+      setPreviewTarget((prev) => {
+        if (prev === 'current' || prev === importedEntry?.id) return prev
+        if (prev !== 'first' && list.some((s) => s.id === prev)) return prev
+        return list[0]?.id || 'current'
       })
     } catch {
       setStatusNotice('カタログの取得に失敗しました')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [importedEntry?.id])
 
   useEffect(() => {
     void loadCatalog(false)
@@ -112,7 +148,7 @@ export function CommunityStylesView({
         counts.set(t, (counts.get(t) || 0) + 1)
       }
     }
-    return ['すべて', ...Array.from(counts.keys()).slice(0, 10)]
+    return ['すべて', ...Array.from(counts.keys()).slice(0, 8)]
   }, [styles])
 
   const filteredStyles = useMemo(() => {
@@ -127,14 +163,15 @@ export function CommunityStylesView({
     })
   }, [styles, searchQuery, activeTag])
 
-  const selectedEntry = useMemo(() => {
-    if (importedPreview && selectedId === importedPreview.id) return importedPreview
-    return styles.find((s) => s.id === selectedId) || filteredStyles[0] || null
-  }, [styles, filteredStyles, selectedId, importedPreview])
+  const selectedEntry: SharedStyleEntry | null = useMemo(() => {
+    if (previewTarget === 'current') return null
+    if (importedEntry && previewTarget === importedEntry.id) return importedEntry
+    return styles.find((s) => s.id === previewTarget) || filteredStyles[0] || null
+  }, [previewTarget, importedEntry, styles, filteredStyles])
 
   const previewConfig = useMemo(
-    () => normalizeCommentStyle(selectedEntry?.config || currentStyle),
-    [selectedEntry, currentStyle]
+    () => normalizeCommentStyle(previewTarget === 'current' ? currentStyle : selectedEntry?.config || currentStyle),
+    [previewTarget, selectedEntry, currentStyle]
   )
 
   const notify = (msg: string) => {
@@ -144,12 +181,42 @@ export function CommunityStylesView({
     }, 3200)
   }
 
-  const handleCopyCode = async (entry: SharedStyleEntry) => {
-    const code = encodeShareCode(entry.name, normalizeCommentStyle(entry.config))
+  const handleSwitchMode = (mode: PanelMode) => {
+    setPanelMode(mode)
+    if (mode === 'share') {
+      setPreviewTarget('current')
+      if (!pubName.trim()) {
+        setPubName(activePresetName)
+      }
+    }
+  }
+
+  const handleCopyCode = async (name: string, cfg: CommentStyleConfig, idKey: string) => {
+    const code = encodeShareCode(name, normalizeCommentStyle(cfg))
     await navigator.clipboard.writeText(code)
-    setCopiedId(entry.id)
-    notify(`「${entry.name}」の共有コードをコピーしました`)
+    setCopiedId(idKey)
+    notify(`「${name}」の共有コードをコピーしました`)
     window.setTimeout(() => setCopiedId(null), 1600)
+  }
+
+  const handleExportJsonFile = (name: string, cfg: CommentStyleConfig) => {
+    const baseName = (name || 'nicotube-style').replace(/[\\/:*?"<>|]/g, '_')
+    const payload = {
+      schema: 'nicotube-style-v1',
+      name: name || 'カスタムスタイル',
+      author: pubAuthor.trim() || defaultAuthorName || 'Anonymous',
+      description: pubDesc.trim(),
+      exported_at: new Date().toISOString(),
+      config: cfg,
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${baseName}.nicostyle.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    notify(`${baseName}.nicostyle.json を書き出しました`)
   }
 
   const handleSavePreset = async (entry: SharedStyleEntry) => {
@@ -163,8 +230,9 @@ export function CommunityStylesView({
   }
 
   const handlePublish = async () => {
-    if (!pubName.trim()) {
-      notify('公開するスタイル名を入力してください')
+    const targetName = pubName.trim() || activePresetName
+    if (!targetName) {
+      notify('スタイル名を入力してください')
       return
     }
     setPublishing(true)
@@ -176,26 +244,25 @@ export function CommunityStylesView({
         .filter(Boolean)
         .slice(0, 6)
       const res = await api.shareStyleToGithub({
-        name: pubName.trim(),
+        name: targetName,
         author: pubAuthor.trim() || 'Anonymous',
         description: pubDesc.trim(),
         tags,
         config: currentStyle,
       })
       setStyles((prev) => [res.entry, ...prev.filter((p) => p.id !== res.entry.id)])
-      setSelectedId(res.entry.id)
       if (res.method === 'gist') {
         setPublishResult({
           message: hasRelayServer
-            ? 'Gist 公開およびリレーサーバーへ送信しました'
+            ? 'Gist とリレーサーバーへ公開しました'
             : 'GitHub Gist に公開しました',
           url: res.url,
         })
       } else {
         setPublishResult({
           message: hasRelayServer
-            ? 'リレーサーバーへ送信しました。GitHub全体カタログ登録用ページを開けます。'
-            : 'GitHub コミュニティ掲載リクエストを作成しました。開いたページから送信できます。',
+            ? 'リレーサーバーへ送信しました（GitHub カタログ掲載ページも開きました）'
+            : 'GitHub カタログ掲載リクエスト画面を開きました',
           url: res.url,
         })
         if (window.nicotube?.openExternal) {
@@ -204,39 +271,75 @@ export function CommunityStylesView({
           window.open(res.url, '_blank')
         }
       }
-      setPubName('')
       setPubDesc('')
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'スタイル公開に失敗しました')
+      notify(err instanceof Error ? err.message : '公開に失敗しました')
     } finally {
       setPublishing(false)
     }
   }
 
-  const handleImportPreview = async () => {
+  const handleImportTextOrUrl = async () => {
     const raw = importInput.trim()
     if (!raw) return
     setImporting(true)
     try {
-      const imported = await api.importStyleFromUrl(raw)
-      const entry: SharedStyleEntry = {
-        id: `import-${Date.now()}`,
-        name: imported.name,
-        author: imported.author,
-        description: imported.description,
-        tags: imported.tags || ['インポート'],
-        source: 'local',
-        created_at: Date.now() / 1000,
-        config: normalizeCommentStyle(imported.config),
+      let entry: SharedStyleEntry
+      if (raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('NTS1:')) {
+        const imported = await api.importStyleFromUrl(raw)
+        entry = {
+          id: `import-${Date.now()}`,
+          name: imported.name,
+          author: imported.author,
+          description: imported.description,
+          tags: imported.tags || ['インポート'],
+          source: 'local',
+          created_at: Date.now() / 1000,
+          config: normalizeCommentStyle(imported.config),
+        }
+      } else {
+        const decoded = decodeShareText(raw)
+        entry = {
+          id: `import-${Date.now()}`,
+          name: decoded.name,
+          author: 'Paste',
+          description: '貼り付けた JSON から読み込み',
+          tags: ['インポート'],
+          source: 'local',
+          created_at: Date.now() / 1000,
+          config: decoded.config,
+        }
       }
-      setImportedPreview(entry)
-      setSelectedId(entry.id)
+      setImportedEntry(entry)
+      setPreviewTarget(entry.id)
       setImportInput('')
-      notify(`「${entry.name}」をプレビューに読み込みました`)
+      notify(`「${entry.name}」を読み込みました`)
     } catch (err) {
-      notify(err instanceof Error ? err.message : '読込に失敗しました')
+      notify(err instanceof Error ? err.message : '読み込みに失敗しました')
     } finally {
       setImporting(false)
+    }
+  }
+
+  const handleImportFile = async (file: File) => {
+    try {
+      const text = await file.text()
+      const decoded = decodeShareText(text)
+      const entry: SharedStyleEntry = {
+        id: `import-${Date.now()}`,
+        name: decoded.name || file.name.replace(/\.nicostyle\.json$|\.json$/i, ''),
+        author: 'File',
+        description: file.name,
+        tags: ['ファイル'],
+        source: 'local',
+        created_at: Date.now() / 1000,
+        config: decoded.config,
+      }
+      setImportedEntry(entry)
+      setPreviewTarget(entry.id)
+      notify(`「${entry.name}」を読み込みました`)
+    } catch {
+      notify('有効な .nicostyle.json ファイルではありません')
     }
   }
 
@@ -244,209 +347,137 @@ export function CommunityStylesView({
     try {
       await api.deleteSharedStyle(entry.id)
       setStyles((prev) => prev.filter((s) => s.id !== entry.id))
-      if (selectedId === entry.id) {
-        setSelectedId(styles.find((s) => s.id !== entry.id)?.id || null)
+      if (previewTarget === entry.id) {
+        setPreviewTarget(styles.find((s) => s.id !== entry.id)?.id || 'current')
       }
-      notify('ローカル共有エントリーを削除しました')
+      notify('公開履歴から削除しました')
     } catch (err) {
       notify(err instanceof Error ? err.message : '削除に失敗しました')
     }
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="mx-auto w-full max-w-[1320px] space-y-5 px-8 py-6">
+      {/* Header */}
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-base font-semibold text-[var(--md-on-surface)]">
-            みんなのコメントスタイル
+          <h1 className="text-[24px] font-medium tracking-tight" style={{ color: 'var(--md-on-surface)' }}>
+            みんなのスタイル
           </h1>
-          <p className="mt-0.5 text-xs text-[var(--md-on-surface-muted)]">
-            GitHubカタログや共有サーバー上のスタイルをライブプレビューで確認し、そのまま適用または公開できます
+          <p className="mt-1 text-[13px]" style={{ color: 'var(--md-on-surface-variant)' }}>
+            共有スタイルのライブ試聴、読み込み、および現在調整中のスタイルの公開・書き出しを行います
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setActionPanel((v) => (v === 'import' ? 'none' : 'import'))}
-            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-              actionPanel === 'import'
-                ? 'border-[var(--md-primary)] bg-[var(--md-primary-tonal)] text-[var(--md-on-primary-tonal)]'
-                : 'border-[var(--md-outline-variant)] bg-[var(--md-surface)] text-[var(--md-on-surface-variant)] hover:bg-[var(--md-surface-high)]'
-            }`}
-          >
-            <Download className="h-3.5 w-3.5" strokeWidth={1.5} />
-            <span>URL / コード読込</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setActionPanel((v) => (v === 'publish' ? 'none' : 'publish'))}
-            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-              actionPanel === 'publish'
-                ? 'border-[var(--md-primary)] bg-[var(--md-primary)] text-[var(--md-on-primary)]'
-                : 'border-[var(--md-outline-variant)] bg-[var(--md-surface)] text-[var(--md-on-surface)] hover:bg-[var(--md-surface-high)]'
-            }`}
-          >
-            <Share2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-            <span>自分の設定を公開</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => loadCatalog(true)}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface)] px-3 py-1.5 text-xs font-medium text-[var(--md-on-surface-variant)] hover:bg-[var(--md-surface-high)]"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} strokeWidth={1.5} />
-            <span>更新</span>
-          </button>
-        </div>
+
+        <button
+          type="button"
+          onClick={() => loadCatalog(true)}
+          disabled={loading}
+          className="ease-studio flex h-9 items-center gap-2 rounded-lg border px-3 text-[12px] font-medium transition-colors duration-150"
+          style={{
+            backgroundColor: 'var(--md-surface-low)',
+            borderColor: 'var(--md-outline-variant)',
+            color: 'var(--md-on-surface-variant)',
+          }}
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} strokeWidth={1.5} />
+          <span>カタログ再読込</span>
+        </button>
       </div>
 
       {statusNotice && (
-        <div className="rounded-lg border border-[var(--md-primary)]/40 bg-[var(--md-primary-tonal)] px-3 py-2 text-xs text-[var(--md-on-primary-tonal)]">
+        <div
+          className="rounded-xl border px-4 py-2.5 text-[12px]"
+          style={{
+            backgroundColor: 'var(--md-primary-tonal)',
+            borderColor: 'var(--md-primary)',
+            color: 'var(--md-on-primary-tonal)',
+          }}
+        >
           {statusNotice}
         </div>
       )}
 
-      {actionPanel === 'import' && (
-        <div className="rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-medium text-[var(--md-on-surface)]">
-              GitHub Gist / Raw JSON URL / 共有コード (NTS1:...) からインポート
-            </span>
-          </div>
-          <div className="mt-2.5 flex gap-2">
-            <input
-              type="text"
-              value={importInput}
-              onChange={(e) => setImportInput(e.target.value)}
-              placeholder="https://gist.github.com/... または https://raw.githubusercontent.com/... または NTS1:..."
-              className="flex-1 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] px-3 py-2 text-xs text-[var(--md-on-surface)] placeholder:text-[var(--md-on-surface-muted)] focus:border-[var(--md-primary)] focus:outline-none"
-            />
-            <button
-              type="button"
-              onClick={handleImportPreview}
-              disabled={importing || !importInput.trim()}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--md-primary)] px-4 py-2 text-xs font-medium text-[var(--md-on-primary)] disabled:opacity-50"
-            >
-              <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>{importing ? '読込中...' : 'プレビュー表示'}</span>
-            </button>
-          </div>
-        </div>
-      )}
+      <div className="grid grid-cols-12 gap-5">
+        {/* Left Stage (7 cols): Live Preview Canvas + Active Inspected Style Card */}
+        <div className="col-span-12 space-y-4 lg:col-span-7">
+          <DanmakuCanvas styleConfig={previewConfig} thumbnailUrl={thumbnailUrl} />
 
-      {actionPanel === 'publish' && (
-        <div className="rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] p-4 space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <div className="text-xs font-medium text-[var(--md-on-surface)]">
-                現在のコメントスタイルを公開する
-              </div>
-              <p className="mt-0.5 text-[11px] text-[var(--md-on-surface-muted)]">
-                {hasGithubToken
-                  ? 'GitHubトークン設定済み: 公開Gistを自動作成しURLを発行します'
-                  : '公開用GitHub Issue投稿ページを生成します（リレーサーバー設定時は即時反映）'}
-              </p>
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <label className="block space-y-1">
-              <span className="text-[11px] text-[var(--md-on-surface-muted)]">スタイル名</span>
-              <input
-                type="text"
-                value={pubName}
-                onChange={(e) => setPubName(e.target.value)}
-                placeholder="例: 夜雑談パステル弾幕"
-                className="w-full rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] px-3 py-2 text-xs text-[var(--md-on-surface)] focus:border-[var(--md-primary)] focus:outline-none"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-[11px] text-[var(--md-on-surface-muted)]">作成者名</span>
-              <input
-                type="text"
-                value={pubAuthor}
-                onChange={(e) => setPubAuthor(e.target.value)}
-                placeholder="ハンドルネーム"
-                className="w-full rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] px-3 py-2 text-xs text-[var(--md-on-surface)] focus:border-[var(--md-primary)] focus:outline-none"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-[11px] text-[var(--md-on-surface-muted)]">タグ (カンマ区切り)</span>
-              <input
-                type="text"
-                value={pubTags}
-                onChange={(e) => setPubTags(e.target.value)}
-                placeholder="FPS, Twitch, 太縁"
-                className="w-full rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] px-3 py-2 text-xs text-[var(--md-on-surface)] focus:border-[var(--md-primary)] focus:outline-none"
-              />
-            </label>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              type="text"
-              value={pubDesc}
-              onChange={(e) => setPubDesc(e.target.value)}
-              placeholder="特徴やおすすめの配信ジャンルを入力..."
-              className="flex-1 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] px-3 py-2 text-xs text-[var(--md-on-surface)] focus:border-[var(--md-primary)] focus:outline-none"
-            />
-            <button
-              type="button"
-              onClick={handlePublish}
-              disabled={publishing || !pubName.trim()}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--md-primary)] px-4 py-2 text-xs font-medium text-[var(--md-on-primary)] disabled:opacity-50"
-            >
-              <Globe className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>{publishing ? '送信中...' : '公開する'}</span>
-            </button>
-          </div>
-          {publishResult && (
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--md-positive)]/30 bg-[var(--md-positive)]/10 px-3 py-2 text-xs text-[var(--md-on-surface)]">
-              <span>{publishResult.message}</span>
-              {publishResult.url && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (window.nicotube?.openExternal) {
-                      window.nicotube.openExternal(publishResult.url!)
-                    } else {
-                      window.open(publishResult.url, '_blank')
-                    }
-                  }}
-                  className="inline-flex items-center gap-1 text-xs font-medium text-[var(--md-primary)] hover:underline"
+          <div
+            className="rounded-2xl border p-5"
+            style={{
+              backgroundColor: 'var(--md-surface-low)',
+              borderColor: 'var(--md-outline-variant)',
+            }}
+          >
+            {previewTarget === 'current' || !selectedEntry ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="rounded-md px-2 py-0.5 text-[11px] font-medium"
+                      style={{
+                        backgroundColor: 'var(--md-primary-tonal)',
+                        color: 'var(--md-on-primary-tonal)',
+                      }}
+                    >
+                      編集中の自分の設定
+                    </span>
+                    <h2 className="text-[15px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                      {activePresetName}
+                    </h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onApplyStyle(currentStyle, true)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface)',
+                    }}
+                  >
+                    <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>スタジオで調整</span>
+                  </button>
+                </div>
+                <div
+                  className="font-mono-tabular flex flex-wrap items-center gap-2 text-[11px]"
+                  style={{ color: 'var(--md-on-surface-muted)' }}
                 >
-                  <span>URLを開く</span>
-                  <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
-        {/* Left: Live Danmaku Preview Stage */}
-        <div className="xl:col-span-7 space-y-3">
-          <DanmakuCanvas
-            styleConfig={previewConfig}
-            thumbnailUrl={thumbnailUrl}
-          />
-
-          {selectedEntry && (
-            <div className="rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
+                  <span>{previewConfig.font_family} ({previewConfig.font_weight})</span>
+                  <span>·</span>
+                  <span>倍率 {previewConfig.font_scale.toFixed(2)}x</span>
+                  <span>·</span>
+                  <span>縁取り {previewConfig.outline_width.toFixed(1)}px</span>
+                  <span>·</span>
+                  <span>領域 {Math.round(previewConfig.display_area_ratio * 100)}%</span>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="text-sm font-semibold text-[var(--md-on-surface)]">
+                    <h2 className="text-[15px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
                       {selectedEntry.name}
                     </h2>
-                    <span className="rounded-md bg-[var(--md-surface-high)] px-2 py-0.5 text-[10px] font-medium text-[var(--md-on-surface-variant)]">
+                    <span
+                      className="rounded-md px-2 py-0.5 text-[11px]"
+                      style={{
+                        backgroundColor: 'var(--md-surface-high)',
+                        color: 'var(--md-on-surface-variant)',
+                      }}
+                    >
                       {SOURCE_LABELS[selectedEntry.source || 'github'] || selectedEntry.source}
                     </span>
                   </div>
-                  <p className="mt-1 text-xs text-[var(--md-on-surface-variant)]">
+                  <p className="mt-1 text-[12px]" style={{ color: 'var(--md-on-surface-variant)' }}>
                     {selectedEntry.description || '説明なし'}
                   </p>
-                  <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[11px] font-mono tabular-nums text-[var(--md-on-surface-muted)]">
+                  <div
+                    className="font-mono-tabular mt-2 flex flex-wrap items-center gap-2 text-[11px]"
+                    style={{ color: 'var(--md-on-surface-muted)' }}
+                  >
                     <span>作者: {selectedEntry.author}</span>
                     <span>·</span>
                     <span>{previewConfig.font_family} ({previewConfig.font_weight})</span>
@@ -458,183 +489,584 @@ export function CommunityStylesView({
                     <span>領域 {Math.round(previewConfig.display_area_ratio * 100)}%</span>
                   </div>
                 </div>
+
+                <div
+                  className="flex flex-wrap items-center gap-2 border-t pt-3"
+                  style={{ borderColor: 'var(--md-outline-variant)' }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onApplyStyle(previewConfig, false)
+                      notify(`「${selectedEntry.name}」を現在の設定に適用しました`)
+                    }}
+                    className="ease-studio inline-flex h-9 items-center gap-1.5 rounded-lg px-4 text-[12px] font-medium transition-opacity duration-150 hover:opacity-90"
+                    style={{
+                      backgroundColor: 'var(--md-primary)',
+                      color: 'var(--md-on-primary)',
+                    }}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>このスタイルを使う</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onApplyStyle(previewConfig, true)}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface)',
+                    }}
+                  >
+                    <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>調整する</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSavePreset(selectedEntry)}
+                    disabled={savingPreset}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface-variant)',
+                    }}
+                  >
+                    <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>プリセット登録</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCopyCode(selectedEntry.name, previewConfig, selectedEntry.id)}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface-variant)',
+                    }}
+                  >
+                    {copiedId === selectedEntry.id ? (
+                      <Check className="h-3.5 w-3.5" style={{ color: 'var(--md-positive)' }} strokeWidth={1.5} />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    )}
+                    <span>コードコピー</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel (5 cols): Single Unified Workspace (Browse / Publish & Export / Import) */}
+        <div className="col-span-12 space-y-4 lg:col-span-5">
+          {/* Segmented Mode Switcher */}
+          <div
+            className="grid grid-cols-3 gap-1 rounded-xl p-1"
+            style={{
+              backgroundColor: 'var(--md-surface-low)',
+              border: '1px solid var(--md-outline-variant)',
+            }}
+          >
+            {(
+              [
+                ['browse', '一覧から選ぶ', Layers],
+                ['share', '今の設定を公開', Share2],
+                ['import', '外部から読込', Download],
+              ] as Array<[PanelMode, string, typeof Layers]>
+            ).map(([mode, label, Icon]) => {
+              const active = panelMode === mode
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => handleSwitchMode(mode)}
+                  className="ease-studio flex h-9 items-center justify-center gap-1.5 rounded-lg text-[12px] font-medium transition-colors duration-150"
+                  style={{
+                    backgroundColor: active ? 'var(--md-surface-highest)' : 'transparent',
+                    color: active ? 'var(--md-on-surface)' : 'var(--md-on-surface-muted)',
+                  }}
+                >
+                  <Icon className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  <span>{label}</span>
+                </button>
+              )
+            })}
+          </div>
+
+          {/* MODE 1: BROWSE CATALOG */}
+          {panelMode === 'browse' && (
+            <div className="space-y-3">
+              <div
+                className="space-y-2.5 rounded-2xl border p-4"
+                style={{
+                  backgroundColor: 'var(--md-surface-low)',
+                  borderColor: 'var(--md-outline-variant)',
+                }}
+              >
+                <div
+                  className="flex h-9 items-center gap-2 rounded-lg border px-3"
+                  style={{
+                    backgroundColor: 'var(--md-surface)',
+                    borderColor: 'var(--md-outline-variant)',
+                  }}
+                >
+                  <Search className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--md-on-surface-muted)' }} strokeWidth={1.5} />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="スタイル名・タグ・制作者で検索"
+                    className="w-full bg-transparent text-[12px] outline-none"
+                    style={{ color: 'var(--md-on-surface)' }}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {allTags.map((tag) => {
+                    const active = activeTag === tag
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => setActiveTag(tag)}
+                        className="rounded-md px-2 py-1 text-[11px] font-medium transition-colors duration-150"
+                        style={{
+                          backgroundColor: active ? 'var(--md-primary-tonal)' : 'var(--md-surface)',
+                          color: active ? 'var(--md-on-primary-tonal)' : 'var(--md-on-surface-muted)',
+                        }}
+                      >
+                        {tag}
+                      </button>
+                    )
+                  })}
+                </div>
               </div>
 
-              <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-[var(--md-outline-variant)] pt-3">
-                <button
-                  type="button"
-                  onClick={() => {
-                    onApplyStyle(previewConfig, false)
-                    notify(`「${selectedEntry.name}」を現在の合成スタイルに適用しました`)
+              <div className="max-h-[540px] space-y-2 overflow-y-auto pr-1">
+                {importedEntry && (
+                  <button
+                    type="button"
+                    onClick={() => setPreviewTarget(importedEntry.id)}
+                    className="w-full rounded-xl border p-3.5 text-left transition-colors duration-150"
+                    style={{
+                      backgroundColor:
+                        previewTarget === importedEntry.id ? 'var(--md-primary-tonal)' : 'var(--md-surface-low)',
+                      borderColor:
+                        previewTarget === importedEntry.id ? 'var(--md-primary)' : 'var(--md-outline-variant)',
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[12px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                        {importedEntry.name}
+                      </span>
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px]"
+                        style={{
+                          backgroundColor: 'var(--md-surface-high)',
+                          color: 'var(--md-on-surface-variant)',
+                        }}
+                      >
+                        読込済み
+                      </span>
+                    </div>
+                  </button>
+                )}
+
+                {filteredStyles.map((item) => {
+                  const isSelected = previewTarget !== 'current' && selectedEntry?.id === item.id
+                  const cfg = normalizeCommentStyle(item.config)
+                  return (
+                    <div
+                      key={item.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setPreviewTarget(item.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') setPreviewTarget(item.id)
+                      }}
+                      className="cursor-pointer rounded-xl border p-3.5 transition-colors duration-150"
+                      style={{
+                        backgroundColor: isSelected ? 'var(--md-primary-tonal)' : 'var(--md-surface-low)',
+                        borderColor: isSelected ? 'var(--md-primary)' : 'var(--md-outline-variant)',
+                      }}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                              {item.name}
+                            </span>
+                          </div>
+                          <p
+                            className="mt-1 line-clamp-2 text-[11px] leading-relaxed"
+                            style={{ color: 'var(--md-on-surface-variant)' }}
+                          >
+                            {item.description || '説明なし'}
+                          </p>
+                        </div>
+                        {item.source === 'local' && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void handleDeleteLocal(item)
+                            }}
+                            title="公開履歴から削除"
+                            className="rounded-md p-1"
+                            style={{ color: 'var(--md-on-surface-muted)' }}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap gap-1">
+                          {(item.tags || []).slice(0, 3).map((t) => (
+                            <span
+                              key={t}
+                              className="rounded px-1.5 py-0.5 text-[10px]"
+                              style={{
+                                backgroundColor: 'var(--md-surface-high)',
+                                color: 'var(--md-on-surface-variant)',
+                              }}
+                            >
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                        <span className="font-mono-tabular text-[10px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                          {item.author} · {cfg.font_family}
+                        </span>
+                      </div>
+                    </div>
+                  )
+                })}
+
+                {!loading && filteredStyles.length === 0 && (
+                  <div
+                    className="rounded-xl border border-dashed p-6 text-center text-[12px]"
+                    style={{
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface-muted)',
+                    }}
+                  >
+                    条件に一致するスタイルはありません
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* MODE 2: PUBLISH & EXPORT CURRENT STUDIO STYLE */}
+          {panelMode === 'share' && (
+            <div className="space-y-4">
+              <div
+                className="space-y-3 rounded-2xl border p-5"
+                style={{
+                  backgroundColor: 'var(--md-surface-low)',
+                  borderColor: 'var(--md-outline-variant)',
+                }}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                      今のスタイルをコミュニティへ公開
+                    </div>
+                    <p className="mt-0.5 text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                      対象は左プレビューに表示中の「{activePresetName}」です
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewTarget('current')}
+                    className="rounded-lg border px-2.5 py-1 text-[11px]"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface-variant)',
+                    }}
+                  >
+                    対象を確認
+                  </button>
+                </div>
+
+                <div className="space-y-2.5">
+                  <label className="block space-y-1">
+                    <span className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                      公開するスタイル名
+                    </span>
+                    <input
+                      type="text"
+                      value={pubName}
+                      onChange={(e) => setPubName(e.target.value)}
+                      placeholder="例: 夜雑談パステル弾幕"
+                      className="h-9 w-full rounded-lg border px-3 text-[12px] outline-none"
+                      style={{
+                        backgroundColor: 'var(--md-surface)',
+                        borderColor: 'var(--md-outline-variant)',
+                        color: 'var(--md-on-surface)',
+                      }}
+                    />
+                  </label>
+
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <label className="block space-y-1">
+                      <span className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                        制作者名
+                      </span>
+                      <input
+                        type="text"
+                        value={pubAuthor}
+                        onChange={(e) => setPubAuthor(e.target.value)}
+                        placeholder="ハンドルネーム"
+                        className="h-9 w-full rounded-lg border px-3 text-[12px] outline-none"
+                        style={{
+                          backgroundColor: 'var(--md-surface)',
+                          borderColor: 'var(--md-outline-variant)',
+                          color: 'var(--md-on-surface)',
+                        }}
+                      />
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                        タグ (カンマ区切り)
+                      </span>
+                      <input
+                        type="text"
+                        value={pubTags}
+                        onChange={(e) => setPubTags(e.target.value)}
+                        placeholder="FPS, Twitch, 太縁"
+                        className="h-9 w-full rounded-lg border px-3 text-[12px] outline-none"
+                        style={{
+                          backgroundColor: 'var(--md-surface)',
+                          borderColor: 'var(--md-outline-variant)',
+                          color: 'var(--md-on-surface)',
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <label className="block space-y-1">
+                    <span className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                      特徴やおすすめ用途
+                    </span>
+                    <input
+                      type="text"
+                      value={pubDesc}
+                      onChange={(e) => setPubDesc(e.target.value)}
+                      placeholder="例: ゲーム画面の上半分だけに流れる控えめ表示"
+                      className="h-9 w-full rounded-lg border px-3 text-[12px] outline-none"
+                      style={{
+                        backgroundColor: 'var(--md-surface)',
+                        borderColor: 'var(--md-outline-variant)',
+                        color: 'var(--md-on-surface)',
+                      }}
+                    />
+                  </label>
+                </div>
+
+                <div
+                  className="flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-[11px]"
+                  style={{
+                    backgroundColor: 'var(--md-surface)',
+                    borderColor: 'var(--md-outline-variant)',
+                    color: 'var(--md-on-surface-muted)',
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--md-primary)] px-3.5 py-2 text-xs font-medium text-[var(--md-on-primary)] transition-opacity hover:opacity-90"
                 >
-                  <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  <span>このスタイルを適用</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onApplyStyle(previewConfig, true)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface)] px-3 py-2 text-xs font-medium text-[var(--md-on-surface)] hover:bg-[var(--md-surface-high)]"
-                >
-                  <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  <span>適用して詳細調整へ</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleSavePreset(selectedEntry)}
-                  disabled={savingPreset}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface)] px-3 py-2 text-xs font-medium text-[var(--md-on-surface-variant)] hover:bg-[var(--md-surface-high)]"
-                >
-                  <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  <span>プリセット保存</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleCopyCode(selectedEntry)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface)] px-3 py-2 text-xs font-medium text-[var(--md-on-surface-variant)] hover:bg-[var(--md-surface-high)]"
-                >
-                  {copiedId === selectedEntry.id ? (
-                    <Check className="h-3.5 w-3.5 text-[var(--md-positive)]" strokeWidth={1.5} />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  <span>
+                    送信先:{' '}
+                    {hasGithubToken
+                      ? 'GitHub Gist (自動投稿)'
+                      : 'GitHub カタログ掲載ページ'}
+                    {hasRelayServer ? ' + 共有サーバー' : ''}
+                  </span>
+                  {onGoToSettings && (
+                    <button
+                      type="button"
+                      onClick={onGoToSettings}
+                      className="inline-flex items-center gap-1 font-medium"
+                      style={{ color: 'var(--md-on-surface-variant)' }}
+                    >
+                      <Settings2 className="h-3 w-3" strokeWidth={1.5} />
+                      <span>設定</span>
+                    </button>
                   )}
-                  <span>共有コード</span>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handlePublish}
+                  disabled={publishing}
+                  className="ease-studio flex h-10 w-full items-center justify-center gap-2 rounded-lg text-[13px] font-medium transition-opacity duration-150 disabled:opacity-50"
+                  style={{
+                    backgroundColor: 'var(--md-primary)',
+                    color: 'var(--md-on-primary)',
+                  }}
+                >
+                  <Globe className="h-4 w-4" strokeWidth={1.5} />
+                  <span>{publishing ? '公開処理中...' : '今の設定を公開する'}</span>
+                </button>
+
+                {publishResult && (
+                  <div
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 text-[12px]"
+                    style={{
+                      backgroundColor: 'rgba(76, 195, 138, 0.1)',
+                      borderColor: 'rgba(76, 195, 138, 0.25)',
+                      color: 'var(--md-on-surface)',
+                    }}
+                  >
+                    <span>{publishResult.message}</span>
+                    {publishResult.url && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (window.nicotube?.openExternal) {
+                            window.nicotube.openExternal(publishResult.url!)
+                          } else {
+                            window.open(publishResult.url, '_blank')
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 text-[11px] font-medium hover:underline"
+                        style={{ color: 'var(--md-primary)' }}
+                      >
+                        <span>URLを開く</span>
+                        <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Direct Export Box */}
+              <div
+                className="space-y-3 rounded-2xl border p-5"
+                style={{
+                  backgroundColor: 'var(--md-surface-low)',
+                  borderColor: 'var(--md-outline-variant)',
+                }}
+              >
+                <div className="text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                  ファイル / 共有コードで直接渡す
+                </div>
+                <p className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                  Discord・X での共有や、自分の別 PC へのバックアップに使えます
+                </p>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => handleExportJsonFile(pubName.trim() || activePresetName, currentStyle)}
+                    className="flex h-9 items-center justify-center gap-1.5 rounded-lg border text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface)',
+                    }}
+                  >
+                    <FileJson className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>.nicostyle.json 保存</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCopyCode(pubName.trim() || activePresetName, currentStyle, 'current-share')}
+                    className="flex h-9 items-center justify-center gap-1.5 rounded-lg border text-[12px] font-medium"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                      color: 'var(--md-on-surface)',
+                    }}
+                  >
+                    {copiedId === 'current-share' ? (
+                      <Check className="h-3.5 w-3.5" style={{ color: 'var(--md-positive)' }} strokeWidth={1.5} />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    )}
+                    <span>共有コードコピー</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* MODE 3: IMPORT FROM URL / CODE / FILE */}
+          {panelMode === 'import' && (
+            <div
+              className="space-y-4 rounded-2xl border p-5"
+              style={{
+                backgroundColor: 'var(--md-surface-low)',
+                borderColor: 'var(--md-outline-variant)',
+              }}
+            >
+              <div>
+                <div className="text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                  URL / 共有コード / ファイルから読み込む
+                </div>
+                <p className="mt-1 text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                  読み込むと左のキャンバスですぐに動作確認できます
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <textarea
+                  rows={3}
+                  value={importInput}
+                  onChange={(e) => setImportInput(e.target.value)}
+                  placeholder="GitHub Gist / Raw URL、または NTS1:... 共有コードを貼り付け"
+                  className="w-full rounded-lg border p-3 text-[12px] outline-none"
+                  style={{
+                    backgroundColor: 'var(--md-surface)',
+                    borderColor: 'var(--md-outline-variant)',
+                    color: 'var(--md-on-surface)',
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={handleImportTextOrUrl}
+                  disabled={importing || !importInput.trim()}
+                  className="ease-studio flex h-9 w-full items-center justify-center gap-1.5 rounded-lg text-[12px] font-medium transition-opacity duration-150 disabled:opacity-45"
+                  style={{
+                    backgroundColor: 'var(--md-primary)',
+                    color: 'var(--md-on-primary)',
+                  }}
+                >
+                  <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  <span>{importing ? '読み込み中...' : 'プレビューに読み込む'}</span>
+                </button>
+              </div>
+
+              <div
+                className="border-t pt-4"
+                style={{ borderColor: 'var(--md-outline-variant)' }}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".json,.nicostyle.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f) void handleImportFile(f)
+                    e.target.value = ''
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border text-[12px] font-medium"
+                  style={{
+                    backgroundColor: 'var(--md-surface)',
+                    borderColor: 'var(--md-outline-variant)',
+                    color: 'var(--md-on-surface)',
+                  }}
+                >
+                  <FileJson className="h-4 w-4" strokeWidth={1.5} />
+                  <span>.nicostyle.json ファイルを選択して読み込む</span>
                 </button>
               </div>
             </div>
           )}
-        </div>
-
-        {/* Right: Search, Tags & Style Directory */}
-        <div className="xl:col-span-5 space-y-3">
-          <div className="rounded-xl border border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] p-3 space-y-2.5">
-            <div className="relative">
-              <Search
-                className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--md-on-surface-muted)]"
-                strokeWidth={1.5}
-              />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="スタイル名・タグ・作成者で絞り込み"
-                className="w-full rounded-lg border border-[var(--md-outline-variant)] bg-[var(--md-surface-dim)] py-2 pl-8 pr-3 text-xs text-[var(--md-on-surface)] placeholder:text-[var(--md-on-surface-muted)] focus:border-[var(--md-primary)] focus:outline-none"
-              />
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {allTags.map((tag) => (
-                <button
-                  key={tag}
-                  type="button"
-                  onClick={() => setActiveTag(tag)}
-                  className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
-                    activeTag === tag
-                      ? 'bg-[var(--md-primary-tonal)] text-[var(--md-on-primary-tonal)]'
-                      : 'bg-[var(--md-surface)] text-[var(--md-on-surface-muted)] hover:text-[var(--md-on-surface)]'
-                  }`}
-                >
-                  {tag}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="max-h-[540px] space-y-2 overflow-y-auto pr-1">
-            {importedPreview && (
-              <button
-                type="button"
-                onClick={() => setSelectedId(importedPreview.id)}
-                className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                  selectedId === importedPreview.id
-                    ? 'border-[var(--md-primary)] bg-[var(--md-primary-tonal)]'
-                    : 'border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] hover:bg-[var(--md-surface)]'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-[var(--md-on-surface)]">
-                    {importedPreview.name}
-                  </span>
-                  <span className="rounded bg-[var(--md-surface-high)] px-1.5 py-0.5 text-[10px] text-[var(--md-on-surface-variant)]">
-                    インポートプレビュー
-                  </span>
-                </div>
-                <p className="mt-1 line-clamp-2 text-[11px] text-[var(--md-on-surface-muted)]">
-                  {importedPreview.description}
-                </p>
-              </button>
-            )}
-
-            {filteredStyles.map((item) => {
-              const isSelected = selectedEntry?.id === item.id
-              const cfg = normalizeCommentStyle(item.config)
-              return (
-                <div
-                  key={item.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setSelectedId(item.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') setSelectedId(item.id)
-                  }}
-                  className={`cursor-pointer rounded-xl border p-3 transition-colors ${
-                    isSelected
-                      ? 'border-[var(--md-primary)] bg-[var(--md-primary-tonal)]'
-                      : 'border-[var(--md-outline-variant)] bg-[var(--md-surface-low)] hover:bg-[var(--md-surface)]'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--md-primary)]" strokeWidth={1.5} />
-                        <span className="truncate text-xs font-semibold text-[var(--md-on-surface)]">
-                          {item.name}
-                        </span>
-                      </div>
-                      <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-[var(--md-on-surface-variant)]">
-                        {item.description || '説明なし'}
-                      </p>
-                    </div>
-                    {item.source === 'local' && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          void handleDeleteLocal(item)
-                        }}
-                        title="ローカル共有を削除"
-                        className="rounded-md p-1 text-[var(--md-on-surface-muted)] hover:bg-[var(--md-surface-high)] hover:text-[var(--md-error)]"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap gap-1">
-                      {(item.tags || []).slice(0, 3).map((t) => (
-                        <span
-                          key={t}
-                          className="rounded bg-[var(--md-surface-high)] px-1.5 py-0.5 text-[10px] text-[var(--md-on-surface-variant)]"
-                        >
-                          {t}
-                        </span>
-                      ))}
-                    </div>
-                    <span className="font-mono text-[10px] tabular-nums text-[var(--md-on-surface-muted)]">
-                      {item.author} · {cfg.font_family}
-                    </span>
-                  </div>
-                </div>
-              )
-            })}
-
-            {!loading && filteredStyles.length === 0 && (
-              <div className="rounded-xl border border-dashed border-[var(--md-outline-variant)] p-6 text-center text-xs text-[var(--md-on-surface-muted)]">
-                該当する共有スタイルが見つかりませんでした
-              </div>
-            )}
-          </div>
         </div>
       </div>
     </div>

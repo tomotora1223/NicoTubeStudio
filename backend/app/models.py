@@ -198,6 +198,7 @@ class EncodeConfig(BaseModel):
     quality_cq: int = Field(default=20, ge=12, le=34)
     preset_speed: Literal["fast", "medium", "slow"] = "medium"
     container: Literal["mp4", "mkv"] = "mp4"
+    download_thumbnail: bool = False
 
 
 class JobCreateRequest(BaseModel):

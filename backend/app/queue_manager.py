@@ -14,7 +14,12 @@ from .config import TEMP_DIR, load_settings
 from .danmaku_renderer import burn_danmaku_with_ffmpeg
 from .ffmpeg_tools import probe_encoders
 from .models import JobCreateRequest, JobStatus, OutputMode, QueueJob
-from .ytdlp_service import download_video_and_chat, sanitize_filename, transcode_video_only
+from .ytdlp_service import (
+    download_thumbnail_image,
+    download_video_and_chat,
+    sanitize_filename,
+    transcode_video_only,
+)
 
 
 class QueueManager:
@@ -222,6 +227,24 @@ class QueueManager:
             job.stage_label = label
             self._emit_sync("job_updated", job.model_dump())
 
+        base_name = sanitize_filename(req.custom_filename or req.title)
+        if req.clip_start_sec is not None or req.clip_end_sec is not None:
+            s_lbl = int(req.clip_start_sec or 0)
+            e_lbl = int(req.clip_end_sec or 0)
+            base_name = f"{base_name}_clip_{s_lbl}-{e_lbl}"
+
+        thumb_task: Optional[asyncio.Task[Optional[Path]]] = None
+        if req.encode.download_thumbnail:
+            thumb_task = asyncio.create_task(
+                asyncio.to_thread(
+                    download_thumbnail_image,
+                    req.url,
+                    out_dir,
+                    base_name,
+                    req.thumbnail,
+                )
+            )
+
         source_video, chat_path, clip_offset_sec, clip_duration_sec = await asyncio.to_thread(
             download_video_and_chat,
             req.url,
@@ -236,16 +259,19 @@ class QueueManager:
         )
 
         if check_cancel():
+            if thumb_task and not thumb_task.done():
+                thumb_task.cancel()
             raise RuntimeError("Cancelled")
-
-        base_name = sanitize_filename(req.custom_filename or req.title)
-        if req.clip_start_sec is not None or req.clip_end_sec is not None:
-            s_lbl = int(req.clip_start_sec or 0)
-            e_lbl = int(req.clip_end_sec or 0)
-            base_name = f"{base_name}_clip_{s_lbl}-{e_lbl}"
 
         ext = req.encode.container
         outputs: list[str] = []
+        if thumb_task:
+            try:
+                thumb_path = await thumb_task
+                if thumb_path and thumb_path.exists():
+                    outputs.append(str(thumb_path))
+            except Exception:
+                pass
 
         # 2. Produce clean (video_only) output if requested
         if req.encode.output_mode in (OutputMode.VIDEO_ONLY, OutputMode.BOTH):

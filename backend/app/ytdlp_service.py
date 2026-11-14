@@ -16,7 +16,13 @@ from .chat_parser import (
     resolve_twitch_clip_source,
 )
 from .config import BIN_DIR, BUNDLED_BIN_DIR, get_active_cookie_path
-from .ffmpeg_tools import ensure_ffmpeg_in_path, get_media_start_time, get_video_metadata, resolve_ffmpeg_video_args
+from .ffmpeg_tools import (
+    ensure_ffmpeg_in_path,
+    get_audio_codec,
+    get_media_start_time,
+    get_video_metadata,
+    resolve_ffmpeg_video_args,
+)
 from .models import EncodeConfig, EncoderProbeResult, FormatOption, VideoInfoResponse
 from .tool_updater import detect_js_runtime
 
@@ -42,9 +48,9 @@ def _common_ytdlp_opts(cookie_path: Optional[str]) -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "remote_components": ["ejs:github"],
-        "concurrent_fragment_downloads": 16,
-        "http_chunk_size": 10 * 1024 * 1024,
-        "buffersize": 131072,
+        "concurrent_fragment_downloads": 24,
+        "http_chunk_size": 16 * 1024 * 1024,
+        "buffersize": 262144,
         "socket_timeout": 15,
         "retries": 10,
         "fragment_retries": 10,
@@ -590,7 +596,11 @@ def download_video_and_chat(
         if aria2c:
             ydl_opts["external_downloader"] = {"http": aria2c, "https": aria2c}
             ydl_opts["external_downloader_args"] = {
-                "aria2c": ["-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none"]
+                "aria2c": [
+                    "-x", "16", "-s", "16", "-k", "1M",
+                    "--max-connection-per-server=16", "--min-split-size=1M",
+                    "--file-allocation=none",
+                ]
             }
         with ThreadPoolExecutor(max_workers=2 if (need_chat and twitch_mode) else 1) as dl_pool:
             chat_fut = dl_pool.submit(dl_chat_worker) if (need_chat and twitch_mode) else None
@@ -678,10 +688,15 @@ def transcode_video_only(
         clip_in_args += ["-t", f"{clip_duration_sec:.3f}"]
 
     vf_args = ["-vf", f"fps={encode.max_fps}"] if encode.max_fps > 0 else []
-    audio_args = ["-c:a", "copy"] if encode.container == "mkv" else ["-c:a", "aac", "-b:a", "192k"]
+    src_audio_codec = get_audio_codec(source_video)
+    audio_args = (
+        ["-c:a", "copy"]
+        if (encode.container == "mkv" or src_audio_codec == "aac")
+        else ["-c:a", "aac", "-b:a", "192k"]
+    )
     cmd = [
         ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-        "-stats_period", "0.5", "-progress", "pipe:1",
+        "-threads", "0", "-stats_period", "0.5", "-progress", "pipe:1",
         *clip_in_args,
         "-i", source_video, *vf_args, *enc_args, *audio_args, "-movflags", "+faststart", output_video,
     ]
@@ -758,3 +773,54 @@ def transcode_video_only(
     if ret != 0:
         err = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
         raise RuntimeError(f"FFmpeg出力エラー (code {ret}): {err[-400:]}")
+
+
+def download_thumbnail_image(
+    url: str,
+    out_dir: Path,
+    base_stem: str,
+    thumbnail_url: Optional[str] = None,
+) -> Optional[Path]:
+    """Download video thumbnail image directly into out_dir alongside output videos."""
+    import httpx
+    import yt_dlp
+
+    target_url = (thumbnail_url or "").strip()
+    if not target_url:
+        try:
+            cookie_path = get_active_cookie_path()
+            opts = _common_ytdlp_opts(cookie_path)
+            opts["skip_download"] = True
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            thumbs = info.get("thumbnails") or []
+            if thumbs and isinstance(thumbs[-1], dict):
+                target_url = str(thumbs[-1].get("url") or info.get("thumbnail") or "")
+            else:
+                target_url = str(info.get("thumbnail") or "")
+        except Exception:
+            target_url = ""
+
+    if not target_url.startswith(("http://", "https://")):
+        return None
+
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+            resp = client.get(target_url)
+            resp.raise_for_status()
+            ctype = str(resp.headers.get("content-type") or "").lower()
+            ext = "jpg"
+            if "png" in ctype or ".png" in target_url.lower():
+                ext = "png"
+            elif "webp" in ctype or ".webp" in target_url.lower():
+                ext = "webp"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f"{base_stem}_thumb.{ext}"
+            idx = 2
+            while dest.exists():
+                dest = out_dir / f"{base_stem}_thumb_{idx}.{ext}"
+                idx += 1
+            dest.write_bytes(resp.content)
+            return dest
+    except Exception:
+        return None

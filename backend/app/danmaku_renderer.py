@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import queue
 import subprocess
 import threading
 import time
@@ -13,7 +14,7 @@ import numpy as np
 import skia
 
 from .chat_parser import ChatRun, ParsedChatItem, YOUTUBE_SUPERCHAT_TIERS, _contrast_text_for_bg
-from .ffmpeg_tools import find_ffmpeg, get_video_metadata, resolve_ffmpeg_video_args
+from .ffmpeg_tools import find_ffmpeg, get_audio_codec, get_video_metadata, resolve_ffmpeg_video_args
 from .fonts import resolve_typeface_file
 from .models import (
     DEFAULT_SUPERCHAT_TIER_COLORS,
@@ -634,7 +635,12 @@ def burn_danmaku_with_ffmpeg(
         encode.codec, encode.hw_encoder, encode.quality_cq, encode.preset_speed, probe
     )
 
-    audio_args = ["-c:a", "copy"] if encode.container == "mkv" else ["-c:a", "aac", "-b:a", "192k"]
+    src_audio_codec = get_audio_codec(source_video)
+    audio_args = (
+        ["-c:a", "copy"]
+        if (encode.container == "mkv" or src_audio_codec == "aac")
+        else ["-c:a", "aac", "-b:a", "192k"]
+    )
 
     clip_in_args: list[str] = []
     if clip_offset_sec > 0:
@@ -648,6 +654,8 @@ def burn_danmaku_with_ffmpeg(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-threads",
+        "0",
         "-progress",
         "pipe:1",
         *clip_in_args,
@@ -681,6 +689,7 @@ def burn_danmaku_with_ffmpeg(
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=8 * 1024 * 1024,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if proc_hook:
@@ -725,7 +734,7 @@ def burn_danmaku_with_ffmpeg(
     prog_thread.start()
     err_thread.start()
 
-    # Prepare frame buffer backed by numpy + Skia surface
+    # Prepare frame buffer backed by numpy + Skia surface, plus async pipe writer
     frame_buf = np.zeros((height, width, 4), dtype=np.uint8)
     empty_bytes = bytes(height * width * 4)
     img_info = skia.ImageInfo.Make(
@@ -736,24 +745,43 @@ def burn_danmaku_with_ffmpeg(
     blit_paint = skia.Paint()
     blit_sampling = skia.SamplingOptions()
 
+    write_q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=4)
+    write_err: list[BaseException] = []
+
+    def pipe_writer() -> None:
+        assert proc.stdin is not None
+        try:
+            while True:
+                chunk = write_q.get()
+                if chunk is None:
+                    break
+                proc.stdin.write(chunk)
+        except BaseException as exc:
+            write_err.append(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    writer_thread = threading.Thread(target=pipe_writer, daemon=True)
+    writer_thread.start()
+
     next_idx = 0
     active: list[ScheduledDanmaku] = []
     n_sched = len(scheduled)
     start_wall = time.monotonic()
 
     try:
-        assert proc.stdin is not None
         for frame_idx in range(total_frames):
             if cancel_event and cancel_event.is_set():
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
                 raise RuntimeError("ジョブがキャンセルされました")
+            if write_err:
+                raise write_err[0]
 
             t = frame_idx / fps
 
@@ -775,7 +803,7 @@ def burn_danmaku_with_ffmpeg(
             active = still_active
 
             if not active:
-                proc.stdin.write(empty_bytes)
+                write_q.put(empty_bytes)
             else:
                 canvas.clear(skia.ColorTRANSPARENT)
                 for s in active:
@@ -792,7 +820,7 @@ def burn_danmaku_with_ffmpeg(
                         blit_sampling,
                         blit_paint,
                     )
-                proc.stdin.write(frame_buf.data)
+                write_q.put(frame_buf.tobytes())
 
             if progress_cb and (frame_idx % max(1, int(fps // 2)) == 0 or frame_idx == total_frames - 1):
                 pct = min(0.99, (frame_idx + 1) / total_frames)
@@ -805,15 +833,23 @@ def burn_danmaku_with_ffmpeg(
                     eta,
                 )
 
-        proc.stdin.close()
+        write_q.put(None)
+        writer_thread.join(timeout=30.0)
+        if write_err and not isinstance(write_err[0], BrokenPipeError):
+            raise write_err[0]
     except BrokenPipeError:
         pass
     finally:
+        try:
+            write_q.put_nowait(None)
+        except Exception:
+            pass
         if cancel_event and cancel_event.is_set():
             try:
                 proc.kill()
             except Exception:
                 pass
+        writer_thread.join(timeout=2.0)
         if proc_hook:
             proc_hook(proc, False)
 

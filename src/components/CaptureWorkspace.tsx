@@ -927,6 +927,31 @@ export function CaptureWorkspace({
                   className="m3-slider"
                 />
               </label>
+
+              <label
+                className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-2.5"
+                style={{
+                  backgroundColor: 'var(--md-surface)',
+                  borderColor: 'var(--md-outline-variant)',
+                }}
+              >
+                <div className="min-w-0">
+                  <div className="text-[12px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                    サムネイル画像を同時に保存
+                  </div>
+                  <div className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                    動画と同じ出力フォルダへサムネ画像も書き出します
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(encodeConfig.download_thumbnail)}
+                  onChange={(e) =>
+                    onChangeEncode({ ...encodeConfig, download_thumbnail: e.target.checked })
+                  }
+                  className="h-4 w-4 shrink-0 cursor-pointer accent-[var(--md-primary)]"
+                />
+              </label>
             </div>
 
             {/* Primary CTA */}

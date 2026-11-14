@@ -39,9 +39,9 @@ NicoTube Studio は **アプリ本体** と **内部ツール (`yt-dlp` / `FFmpe
 - **取り込み・区間切り抜き（YouTube & Twitch VOD/クリップ対応）**
   - URL解析により利用可能な解像度・FPS・チャット有無・プラットフォームを自動判定
   - プレビュー動画（HLS含む）を確認しながら開始〜終了時刻を指定して部分切り抜き（YouTubeライブチャット / Twitchコメント時刻も自動シフト）
-  - 複数フラグメント並列ダウンロード＋チャット同時取得（`aria2c` 導入環境では自動併用）
+  - 複数フラグメント並列ダウンロード＋チャット同時取得＋サムネイル同時保存（任意チェック、`aria2c` 導入環境では自動併用）
   - 出力モード：「コメント合成あり」「動画のみ」「両方出力」
-  - GPU ハードウェアエンコード（NVIDIA NVENC / Intel QSV / AMD AMF）＆コーデック選択（H.264 / H.265 / AV1）
+  - GPU ハードウェアエンコード（NVIDIA NVENC / Intel QSV / AMD AMF 高速プリセット対応）＆コーデック選択（H.264 / H.265 / AV1）
 - **みんなのスタイル（コミュニティギャラリー＆共有）**
   - GitHub (`community-styles/index.json`) および共有リレーサーバー上のコメントスタイルを **リアルタイム弾幕プレビュー付き** で閲覧し、ワンクリック適用・プリセット保存が可能
   - GitHub Issue 送信 / GitHub Gist 自動公開（任意トークン）/ 共有リレーサーバー (`server/style_relay_worker.js`・`server/style_relay.py`) による自動共有

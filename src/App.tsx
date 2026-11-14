@@ -347,13 +347,15 @@ export default function App() {
             onUpdatePreset={handleUpdatePreset}
             onDeletePreset={handleDeletePreset}
             onOpenFullscreenPreview={() => setFullscreenOpen(true)}
+            onOpenCommunityGallery={() => setActiveTab('gallery')}
             thumbnailUrl={previewThumb}
           />
         </div>
 
-        <div className={activeTab === 'gallery' ? 'block p-6' : 'hidden'}>
+        <div className={activeTab === 'gallery' ? 'block' : 'hidden'}>
           <CommunityStylesView
             currentStyle={commentStyle}
+            activePresetName={presets.find((p) => p.id === activePresetId)?.name || '現在の調整スタイル'}
             thumbnailUrl={previewThumb}
             defaultAuthorName={settings.style_author_name}
             hasRelayServer={Boolean(settings.style_server_url?.trim())}
@@ -363,6 +365,7 @@ export default function App() {
               if (openStudio) setActiveTab('comments')
             }}
             onSaveAsPreset={handleCreatePreset}
+            onGoToSettings={() => setActiveTab('settings')}
           />
         </div>
 
