@@ -9,6 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
+from .chat_parser import (
+    extract_twitch_target,
+    fetch_twitch_chat_to_file,
+    is_twitch_url,
+    resolve_twitch_clip_source,
+)
 from .config import BIN_DIR, BUNDLED_BIN_DIR, get_active_cookie_path
 from .ffmpeg_tools import ensure_ffmpeg_in_path, get_media_start_time, get_video_metadata, resolve_ffmpeg_video_args
 from .models import EncodeConfig, EncoderProbeResult, FormatOption, VideoInfoResponse
@@ -87,11 +93,12 @@ def probe_video_info(url: str) -> VideoInfoResponse:
         if fps:
             fps_set.add(int(round(float(fps))))
 
-        if f_url and protocol in ("https", "http"):
-            # Prefer progressive mp4 (has both audio & video) around 360p-720p for instant HTML5 <video> seek
+        if f_url and protocol in ("https", "http", "m3u8_native", "m3u8"):
+            # Prefer direct HTTP progressive mp4, then HLS m3u8 around 480p for instant <video> seek
             has_audio = 1 if acodec != "none" else 0
             is_mp4 = 1 if ext == "mp4" else 0
-            score = has_audio * 1000 + is_mp4 * 200 - abs(int(height) - 360)
+            is_direct_http = 1 if protocol in ("https", "http") else 0
+            score = is_direct_http * 3000 + has_audio * 1000 + is_mp4 * 200 - abs(int(height) - 480)
             preview_candidates.append((score, int(height), f_url))
 
         formats_out.append(
@@ -113,15 +120,27 @@ def probe_video_info(url: str) -> VideoInfoResponse:
         preview_candidates.sort(key=lambda x: x[0], reverse=True)
         preview_stream_url = preview_candidates[0][2]
 
+    extractor_key = str(info.get("extractor_key") or info.get("extractor") or "").lower()
+    is_twitch = is_twitch_url(url) or extractor_key.startswith("twitch")
+    platform = "twitch" if is_twitch else ("youtube" if "youtube" in extractor_key or "youtu" in url.lower() else "other")
+
     subs = info.get("subtitles") or {}
     auto_caps = info.get("automatic_captions") or {}
     has_live_chat = ("live_chat" in subs) or ("live_chat" in auto_caps)
+    if is_twitch and not has_live_chat:
+        vod_id, clip_slug = extract_twitch_target(url)
+        if vod_id:
+            has_live_chat = True
+        elif clip_slug:
+            resolved_vod, _, _ = resolve_twitch_clip_source(clip_slug)
+            has_live_chat = resolved_vod is not None
 
     return VideoInfoResponse(
         id=str(info.get("id", "")),
         title=str(info.get("title", "Untitled")),
         uploader=str(info.get("uploader") or info.get("channel") or ""),
         channel_id=info.get("channel_id"),
+        platform=platform,
         duration_sec=float(info.get("duration") or 0.0),
         is_live=bool(info.get("is_live")),
         was_live=bool(info.get("was_live")),
@@ -473,10 +492,12 @@ def download_video_and_chat(
         }
     )
 
+    twitch_mode = is_twitch_url(url)
+
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_exe).parent)
 
-    if need_chat:
+    if need_chat and not twitch_mode:
         ydl_opts["writesubtitles"] = True
         ydl_opts["subtitleslangs"] = ["live_chat"]
 
@@ -488,6 +509,33 @@ def download_video_and_chat(
     trim_duration_sec: Optional[float] = None
     video_path: Optional[Path] = None
     chat_path: Optional[Path] = None
+    twitch_chat_dest = work_dir / "source.twitch_chat.json"
+
+    def dl_chat_worker() -> None:
+        if not need_chat:
+            return
+        if twitch_mode:
+            fetch_twitch_chat_to_file(
+                url,
+                twitch_chat_dest,
+                clip_start_sec,
+                clip_end_sec,
+                progress_cb,
+                cancel_check,
+            )
+            return
+        chat_opts = _common_ytdlp_opts(cookie_path)
+        chat_opts.update(
+            {
+                "skip_download": True,
+                "writesubtitles": True,
+                "subtitleslangs": ["live_chat"],
+                "outtmpl": outtmpl,
+                "progress_hooks": [hook],
+            }
+        )
+        with yt_dlp.YoutubeDL(chat_opts) as cydl:
+            cydl.download([url])
 
     if is_clipped:
         if not ffmpeg_exe:
@@ -503,22 +551,6 @@ def download_video_and_chat(
             with yt_dlp.YoutubeDL(probe_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 cj = ydl.cookiejar
-
-            def dl_chat_worker() -> None:
-                if not need_chat:
-                    return
-                chat_opts = _common_ytdlp_opts(cookie_path)
-                chat_opts.update(
-                    {
-                        "skip_download": True,
-                        "writesubtitles": True,
-                        "subtitleslangs": ["live_chat"],
-                        "outtmpl": outtmpl,
-                        "progress_hooks": [hook],
-                    }
-                )
-                with yt_dlp.YoutubeDL(chat_opts) as cydl:
-                    cydl.download([url])
 
             with ThreadPoolExecutor(max_workers=2 if need_chat else 1) as dl_pool:
                 chat_fut = dl_pool.submit(dl_chat_worker) if need_chat else None
@@ -547,8 +579,12 @@ def download_video_and_chat(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
         else:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with ThreadPoolExecutor(max_workers=2 if (need_chat and twitch_mode) else 1) as dl_pool:
+                chat_fut = dl_pool.submit(dl_chat_worker) if (need_chat and twitch_mode) else None
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                if chat_fut:
+                    chat_fut.result()
     else:
         aria2c = _find_aria2c()
         if aria2c:
@@ -556,11 +592,15 @@ def download_video_and_chat(
             ydl_opts["external_downloader_args"] = {
                 "aria2c": ["-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none"]
             }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        with ThreadPoolExecutor(max_workers=2 if (need_chat and twitch_mode) else 1) as dl_pool:
+            chat_fut = dl_pool.submit(dl_chat_worker) if (need_chat and twitch_mode) else None
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            if chat_fut:
+                chat_fut.result()
 
     for p in sorted(work_dir.iterdir()):
-        if p.name.endswith(".live_chat.json"):
+        if p.name.endswith(".live_chat.json") or p.name.endswith(".twitch_chat.json"):
             chat_path = p
         elif not video_path and p.stem in ("source", "source_raw") and p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
             video_path = p

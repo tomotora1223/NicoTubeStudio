@@ -3,6 +3,7 @@ import type {
   AuthStatus,
   CommentStyleConfig,
   EncoderProbeResult,
+  GithubStyleShareResult,
   JobCreateRequest,
   Preset,
   QueueJob,
@@ -68,9 +69,16 @@ export const api = {
   refreshFonts: () => req<SystemFontInfo[]>('/api/fonts/refresh', { method: 'POST' }),
   getFontFileUrl: (family: string) =>
     `${getApiBaseSync()}/api/fonts/file?family=${encodeURIComponent(family)}`,
+  getCommunityStyles: (refresh = false) =>
+    req<SharedStyleEntry[]>(`/api/styles/community?refresh=${refresh ? 'true' : 'false'}`),
   getSharedStyles: () => req<SharedStyleEntry[]>('/api/styles/shared'),
   publishSharedStyle: (payload: SharedStyleCreate) =>
     req<SharedStyleEntry>('/api/styles/shared', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  shareStyleToGithub: (payload: SharedStyleCreate) =>
+    req<GithubStyleShareResult>('/api/styles/share-github', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),

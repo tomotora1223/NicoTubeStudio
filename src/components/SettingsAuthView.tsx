@@ -478,7 +478,7 @@ export function SettingsAuthView({
               >
                 <span>
                   {appUpdateState?.state === 'ready'
-                    ? '再起動してアプリを更新'
+                    ? '再起動して適用（サイレント）'
                     : appUpdateState?.state === 'checking'
                     ? '確認中...'
                     : appUpdateState?.state === 'downloading'
@@ -501,7 +501,7 @@ export function SettingsAuthView({
               style={{ backgroundColor: 'var(--md-surface-high)' }}
             >
               <div
-                className="h-full transition-all"
+                className="ease-studio h-full transition-[width] duration-200"
                 style={{
                   width: `${Math.max(4, Math.min(100, Math.round((appUpdateState.progress || 0) * 100)))}%`,
                   backgroundColor: 'var(--md-primary)',
@@ -622,13 +622,22 @@ export function SettingsAuthView({
             </button>
           </div>
           <p className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-            Setup (NSIS) 版の起動中・起動時に自動ダウンロード＆再起動適用を行います（Portable版は通知のみ）。
+            Setup (NSIS) 版はウィザードを表示せずバックグラウンド準備＋サイレント再起動更新を行います（Portable版は通知のみ）。
           </p>
         </div>
 
         <StyleServerRow
           value={settings.style_server_url || ''}
-          onSave={(nextUrl) => onUpdateSettings({ ...settings, style_server_url: nextUrl })}
+          githubToken={settings.github_style_token || ''}
+          authorName={settings.style_author_name || ''}
+          onSave={(nextUrl, nextToken, nextAuthor) =>
+            onUpdateSettings({
+              ...settings,
+              style_server_url: nextUrl,
+              github_style_token: nextToken,
+              style_author_name: nextAuthor,
+            })
+          }
         />
 
         <div
@@ -689,32 +698,66 @@ export function SettingsAuthView({
 
 function StyleServerRow({
   value,
+  githubToken,
+  authorName,
   onSave,
 }: {
   value: string
-  onSave: (nextUrl: string) => Promise<void> | void
+  githubToken: string
+  authorName: string
+  onSave: (nextUrl: string, nextToken: string, nextAuthor: string) => Promise<void> | void
 }) {
   const [draft, setDraft] = useState(value)
+  const [tokenDraft, setTokenDraft] = useState(githubToken)
+  const [authorDraft, setAuthorDraft] = useState(authorName)
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     setDraft(value)
-  }, [value])
+    setTokenDraft(githubToken)
+    setAuthorDraft(authorName)
+  }, [value, githubToken, authorName])
 
   return (
     <div
-      className="space-y-2 border-t pt-3"
+      className="space-y-2.5 border-t pt-3"
       style={{ borderColor: 'var(--md-outline-variant)' }}
     >
       <div className="text-[12px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
-        コメントスタイル共有サーバー URL（任意）
+        スタイル共有設定（リレーサーバー / GitHub Gist 自動公開・作成者名）
       </div>
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <input
           type="text"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="https://your-style-server.example.com"
+          placeholder="共有サーバーURL（例: https://styles.example.workers.dev）"
+          className="h-8 rounded-lg border px-2.5 text-[12px] outline-none"
+          style={{
+            backgroundColor: 'var(--md-surface)',
+            borderColor: 'var(--md-outline-variant)',
+            color: 'var(--md-on-surface)',
+          }}
+        />
+        <input
+          type="text"
+          value={authorDraft}
+          onChange={(e) => setAuthorDraft(e.target.value)}
+          placeholder="公開時の作成者名（任意）"
+          className="h-8 rounded-lg border px-2.5 text-[12px] outline-none"
+          style={{
+            backgroundColor: 'var(--md-surface)',
+            borderColor: 'var(--md-outline-variant)',
+            color: 'var(--md-on-surface)',
+          }}
+        />
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="password"
+          value={tokenDraft}
+          onChange={(e) => setTokenDraft(e.target.value)}
+          placeholder="GitHub Personal Access Token (gist 権限のみ・任意)"
           className="h-8 min-w-[260px] flex-1 rounded-lg border px-2.5 text-[12px] outline-none"
           style={{
             backgroundColor: 'var(--md-surface)',
@@ -725,7 +768,7 @@ function StyleServerRow({
         <button
           type="button"
           onClick={async () => {
-            await onSave(draft.trim())
+            await onSave(draft.trim(), tokenDraft.trim(), authorDraft.trim())
             setSaved(true)
             setTimeout(() => setSaved(false), 2000)
           }}
@@ -740,7 +783,7 @@ function StyleServerRow({
         </button>
       </div>
       <p className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-        外部の共有スタイル API サーバーを指定すると、コメント演出スタジオの「共有・サーバー」タブに公開スタイルが統合されます。
+        トークン未設定でも「みんなのスタイル」タブから GitHub Issue 経由の公開やリレーサーバー連携が利用できます。
       </p>
     </div>
   )

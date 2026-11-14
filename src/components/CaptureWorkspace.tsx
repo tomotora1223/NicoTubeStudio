@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import Hls from 'hls.js'
 import {
   AlertCircle,
   CheckCircle2,
@@ -176,8 +177,28 @@ export function CaptureWorkspace({
     : [2160, 1440, 1080, 720, 480]
   const totalDur = Math.max(1, Math.floor(videoInfo?.duration_sec || 0))
   const clipSpan = Math.max(0, clipEnd - clipStart)
-
   const needsFfmpeg = !encoders?.ffmpeg_found
+
+  useEffect(() => {
+    const vid = clipVideoRef.current
+    const srcUrl = videoInfo?.preview_stream_url
+    if (!vid || !srcUrl) return
+
+    let hls: Hls | null = null
+    if (srcUrl.includes('.m3u8') && Hls.isSupported()) {
+      hls = new Hls({ enableWorker: true, lowLatencyMode: false })
+      hls.loadSource(srcUrl)
+      hls.attachMedia(vid)
+    } else {
+      vid.src = srcUrl
+    }
+
+    return () => {
+      if (hls) {
+        hls.destroy()
+      }
+    }
+  }, [videoInfo?.preview_stream_url, showRangePreview])
 
   return (
     <div className="mx-auto flex w-full max-w-[1320px] flex-col gap-6 px-8 py-6">
@@ -188,7 +209,7 @@ export function CaptureWorkspace({
             取り込み・切り抜き
           </h1>
           <p className="mt-1 text-[13px]" style={{ color: 'var(--md-on-surface-variant)' }}>
-            YouTube配信アーカイブのURLを解析し、区間切り抜き・画質・コメント合成の有無を設定してキューへ投入します
+            YouTube / Twitch (VOD・クリップ) のURLを解析し、区間切り抜き・画質・コメント合成の有無を設定してキューへ投入します
           </p>
         </div>
         {needsFfmpeg && (
@@ -231,7 +252,7 @@ export function CaptureWorkspace({
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleProbe()
             }}
-            placeholder="https://www.youtube.com/watch?v=... またはライブ配信URL"
+            placeholder="https://www.youtube.com/watch?v=... または https://www.twitch.tv/videos/..."
             className="w-full bg-transparent text-[13px] outline-none"
             style={{ color: 'var(--md-on-surface)' }}
           />
@@ -316,6 +337,16 @@ export function CaptureWorkspace({
                       {videoInfo.title}
                     </h2>
                     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[12px]" style={{ color: 'var(--md-on-surface-variant)' }}>
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px] font-medium"
+                        style={{
+                          backgroundColor:
+                            videoInfo.platform === 'twitch' ? 'rgba(145, 70, 255, 0.16)' : 'var(--md-primary-tonal)',
+                          color: videoInfo.platform === 'twitch' ? '#c084fc' : 'var(--md-on-primary-tonal)',
+                        }}
+                      >
+                        {videoInfo.platform === 'twitch' ? 'Twitch' : 'YouTube'}
+                      </span>
                       <span>{videoInfo.uploader || 'チャンネル不明'}</span>
                       <span>·</span>
                       <span
@@ -326,7 +357,7 @@ export function CaptureWorkspace({
                         }}
                       >
                         <MessageSquare size={12} strokeWidth={1.5} />
-                        {videoInfo.has_live_chat ? 'ライブチャット取得可能' : 'チャットデータなし'}
+                        {videoInfo.has_live_chat ? 'コメント取得可能' : 'チャットデータなし'}
                       </span>
                     </div>
                   </div>
@@ -338,7 +369,7 @@ export function CaptureWorkspace({
                       style={{ color: 'var(--md-on-surface-muted)' }}
                     >
                       <ExternalLink size={13} strokeWidth={1.5} />
-                      <span>YouTubeで開く</span>
+                      <span>元のページを開く</span>
                     </button>
                   </div>
                 </div>
@@ -525,7 +556,6 @@ export function CaptureWorkspace({
                         <div className="mx-auto aspect-video w-full max-w-[460px] overflow-hidden rounded-lg bg-black">
                           <video
                             ref={clipVideoRef}
-                            src={videoInfo.preview_stream_url}
                             controls
                             preload="metadata"
                             onTimeUpdate={(e) => setPreviewCurrentSec(Math.floor(e.currentTarget.currentTime))}

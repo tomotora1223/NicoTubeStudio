@@ -12,6 +12,7 @@ Set-Location "$Root\backend"
     --clean `
     --onedir `
     --name nicotube-backend `
+    --add-data "$Root\community-styles;community-styles" `
     --collect-submodules yt_dlp `
     --collect-all skia `
     --hidden-import uvicorn.logging `

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { CaptureWorkspace } from './components/CaptureWorkspace'
 import { CommentStudioView } from './components/CommentStudioView'
+import { CommunityStylesView } from './components/CommunityStylesView'
 import { FullscreenPreviewModal } from './components/FullscreenPreviewModal'
 import { NavRail, type NavTab } from './components/NavRail'
 import { QueueView } from './components/QueueView'
@@ -347,6 +348,21 @@ export default function App() {
             onDeletePreset={handleDeletePreset}
             onOpenFullscreenPreview={() => setFullscreenOpen(true)}
             thumbnailUrl={previewThumb}
+          />
+        </div>
+
+        <div className={activeTab === 'gallery' ? 'block p-6' : 'hidden'}>
+          <CommunityStylesView
+            currentStyle={commentStyle}
+            thumbnailUrl={previewThumb}
+            defaultAuthorName={settings.style_author_name}
+            hasRelayServer={Boolean(settings.style_server_url?.trim())}
+            hasGithubToken={Boolean(settings.github_style_token?.trim())}
+            onApplyStyle={(cfg, openStudio) => {
+              handleChangeCommentStyle(cfg)
+              if (openStudio) setActiveTab('comments')
+            }}
+            onSaveAsPreset={handleCreatePreset}
           />
         </div>
 

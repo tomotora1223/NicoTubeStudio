@@ -1,7 +1,7 @@
-import { Download, Layers, MessageSquareText, Settings2, TvMinimalPlay } from 'lucide-react'
+import { Compass, Download, Layers, MessageSquareText, Settings2, TvMinimalPlay } from 'lucide-react'
 import type { AuthStatus } from '../types/studio'
 
-export type NavTab = 'capture' | 'comments' | 'queue' | 'settings'
+export type NavTab = 'capture' | 'comments' | 'gallery' | 'queue' | 'settings'
 
 interface NavRailProps {
   activeTab: NavTab
@@ -19,6 +19,7 @@ export function NavRail({
   const items: Array<{ id: NavTab; label: string; icon: typeof Download; badge?: number }> = [
     { id: 'capture', label: '取り込み・切り抜き', icon: Download },
     { id: 'comments', label: 'コメントスタジオ', icon: MessageSquareText },
+    { id: 'gallery', label: 'みんなのスタイル', icon: Compass },
     { id: 'queue', label: '処理キュー', icon: Layers, badge: activeJobCount },
     { id: 'settings', label: 'アカウント・設定', icon: Settings2 },
   ]
@@ -38,7 +39,7 @@ export function NavRail({
             className="flex h-8 w-8 items-center justify-center rounded-lg"
             style={{ backgroundColor: 'var(--md-primary-tonal)', color: 'var(--md-primary)' }}
           >
-            <TvMinimalPlay size={18} strokeWidth={1.6} />
+            <TvMinimalPlay size={18} strokeWidth={1.5} />
           </div>
           <div className="leading-tight">
             <div className="text-[15px] font-medium tracking-tight" style={{ color: 'var(--md-on-surface)' }}>

@@ -349,6 +349,8 @@ function parseUpdateFeed(rawUrl) {
 function setupAutoUpdater() {
   autoUpdater.autoDownload = !isPortable
   autoUpdater.autoInstallOnAppQuit = !isPortable
+  autoUpdater.allowDowngrade = false
+  autoUpdater.autoRunAppAfterInstall = true
 
   autoUpdater.on('checking-for-update', () => {
     sendAppUpdateState({ state: 'checking', progress: 0, message: 'アプリの更新を確認中...' })
@@ -386,7 +388,7 @@ function setupAutoUpdater() {
       state: 'ready',
       version: info?.version || app.getVersion(),
       progress: 1,
-      message: `v${info?.version || ''} の準備完了（再起動で適用）`,
+      message: `v${info?.version || ''} の準備完了（ウィザードなしで自動適用）`,
     })
   })
   autoUpdater.on('error', (err) => {
@@ -448,7 +450,9 @@ ipcMain.handle('check-app-update', (_e, feedUrl) => checkForAppUpdates(feedUrl))
 ipcMain.handle('install-app-update', () => {
   if (app.isPackaged && !isPortable) {
     stopBackend()
-    autoUpdater.quitAndInstall(false, true)
+    setTimeout(() => {
+      autoUpdater.quitAndInstall(true, true)
+    }, 350)
   }
 })
 

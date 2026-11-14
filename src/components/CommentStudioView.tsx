@@ -530,10 +530,10 @@ export function CommentStudioView({
                   style={{
                     borderColor: active ? 'var(--md-primary)' : 'transparent',
                     color: active ? 'var(--md-primary)' : 'var(--md-on-surface-muted)',
-                    backgroundColor: active ? 'rgba(208, 188, 255, 0.06)' : 'transparent',
+                    backgroundColor: active ? 'var(--md-primary-tonal)' : 'transparent',
                   }}
                 >
-                  <Icon className="h-3.5 w-3.5" />
+                  <Icon className="h-3.5 w-3.5" strokeWidth={1.5} />
                   <span className="truncate">{t.label}</span>
                 </button>
               )
@@ -1815,7 +1815,7 @@ function SliderField({
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="h-1.5 w-full cursor-pointer accent-[var(--md-primary)]"
+        className="m3-slider w-full cursor-pointer"
       />
     </div>
   )

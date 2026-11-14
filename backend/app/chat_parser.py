@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -10,6 +11,156 @@ from typing import Callable, Optional
 import httpx
 
 from .config import EMOTE_CACHE_DIR
+
+TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+TWITCH_COMMENTS_SHA256 = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
+
+
+def is_twitch_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "twitch.tv/" in u
+
+
+def extract_twitch_target(url: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (video_id, clip_slug) extracted from a Twitch URL."""
+    vod_m = re.search(r"twitch\.tv/videos/(\d+)", url, re.IGNORECASE)
+    if vod_m:
+        return vod_m.group(1), None
+    clip_m = re.search(r"(?:clips\.twitch\.tv/|twitch\.tv/[^/]+/clip/)([A-Za-z0-9_-]+)", url, re.IGNORECASE)
+    if clip_m:
+        return None, clip_m.group(1)
+    return None, None
+
+
+def resolve_twitch_clip_source(clip_slug: str) -> tuple[Optional[str], float, Optional[float]]:
+    """Resolve a Twitch clip slug to (source_vod_id, vod_offset_sec, clip_duration_sec)."""
+    query = (
+        f'{{ clip(slug: "{clip_slug}") {{ '
+        f"video {{ id }} videoOffsetSeconds durationSeconds }} }}"
+    )
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            resp = client.post(
+                TWITCH_GQL_URL,
+                headers={"Client-ID": TWITCH_CLIENT_ID, "Content-Type": "application/json"},
+                json={"query": query},
+            )
+            if resp.status_code != 200:
+                return None, 0.0, None
+            clip = ((resp.json() or {}).get("data") or {}).get("clip") or {}
+            vod_id = ((clip.get("video") or {}).get("id")) or None
+            offset = float(clip.get("videoOffsetSeconds") or 0.0)
+            dur = float(clip.get("durationSeconds") or 0.0) or None
+            return str(vod_id) if vod_id else None, offset, dur
+    except Exception:
+        return None, 0.0, None
+
+
+def fetch_twitch_chat_to_file(
+    url: str,
+    dest_path: Path,
+    clip_start_sec: Optional[float] = None,
+    clip_end_sec: Optional[float] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[Path]:
+    """Fetch Twitch VOD / Clip comments via public GQL API and save standardized JSON."""
+    vod_id, clip_slug = extract_twitch_target(url)
+    base_offset = 0.0
+    if clip_slug:
+        resolved_vod, vod_offset, clip_dur = resolve_twitch_clip_source(clip_slug)
+        if not resolved_vod:
+            return None
+        vod_id = resolved_vod
+        base_offset = vod_offset
+        fetch_start = base_offset + max(0.0, float(clip_start_sec or 0.0))
+        if clip_end_sec is not None:
+            fetch_end: Optional[float] = base_offset + float(clip_end_sec)
+        elif clip_dur is not None:
+            fetch_end = base_offset + clip_dur
+        else:
+            fetch_end = None
+    elif vod_id:
+        fetch_start = max(0.0, float(clip_start_sec or 0.0))
+        fetch_end = float(clip_end_sec) if clip_end_sec is not None else None
+    else:
+        return None
+
+    collected: list[dict] = []
+    cursor: Optional[str] = None
+    max_pages = 300
+    headers = {"Client-ID": TWITCH_CLIENT_ID, "Content-Type": "application/json"}
+
+    with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        for page_idx in range(max_pages):
+            if cancel_check and cancel_check():
+                raise RuntimeError("Cancelled by user")
+            variables = {"videoID": str(vod_id)}
+            if cursor:
+                variables["cursor"] = cursor
+            else:
+                variables["contentOffsetSeconds"] = max(0, int(fetch_start))
+
+            payload = [
+                {
+                    "operationName": "VideoCommentsByOffsetOrCursor",
+                    "variables": variables,
+                    "extensions": {
+                        "persistedQuery": {
+                            "version": 1,
+                            "sha256Hash": TWITCH_COMMENTS_SHA256,
+                        }
+                    },
+                }
+            ]
+            resp = client.post(TWITCH_GQL_URL, headers=headers, json=payload)
+            if resp.status_code != 200:
+                break
+            body = resp.json()
+            if not isinstance(body, list) or not body:
+                break
+            comments_conn = ((body[0].get("data") or {}).get("video") or {}).get("comments") or {}
+            edges = comments_conn.get("edges") or []
+            if not edges:
+                break
+
+            reached_end = False
+            for edge in edges:
+                node = edge.get("node") or {}
+                raw_offset = node.get("contentOffsetSeconds")
+                if raw_offset is None:
+                    continue
+                offset_val = float(raw_offset)
+                if fetch_end is not None and offset_val > fetch_end + 1.5:
+                    reached_end = True
+                    break
+                # Normalize relative to clip base offset when fetching a clip
+                rel_offset = offset_val - base_offset
+                if rel_offset < 0:
+                    continue
+                node_copy = dict(node)
+                node_copy["contentOffsetSeconds"] = rel_offset
+                collected.append(node_copy)
+                cursor = edge.get("cursor") or cursor
+
+            if progress_cb and page_idx % 3 == 0:
+                progress_cb(0.05, f"Twitchコメント取得中 ({len(collected)}件)...")
+
+            has_next = bool((comments_conn.get("pageInfo") or {}).get("hasNextPage"))
+            if reached_end or not has_next or not cursor:
+                break
+
+    if not collected:
+        return None
+
+    dest_path.write_text(
+        json.dumps({"source": "twitch", "vod_id": vod_id, "comments": collected}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if progress_cb:
+        progress_cb(0.06, f"Twitchコメント取得完了 ({len(collected)}件)")
+    return dest_path
 
 
 @dataclass
@@ -170,6 +321,82 @@ def _detect_author_role(renderer: dict) -> str:
     return "member" if is_member else "normal"
 
 
+def _parse_twitch_chat_payload(
+    nodes: list[dict],
+    c_start: float,
+    c_end: Optional[float],
+    ng_lower: list[str],
+) -> list[ParsedChatItem]:
+    result: list[ParsedChatItem] = []
+    for node in nodes:
+        raw_offset = node.get("contentOffsetSeconds")
+        if raw_offset is None:
+            continue
+        offset_sec = float(raw_offset)
+        if offset_sec < c_start:
+            continue
+        if c_end is not None and offset_sec > c_end:
+            continue
+
+        msg = node.get("message") or {}
+        frags = msg.get("fragments") or []
+        runs: list[ChatRun] = []
+        plain_parts: list[str] = []
+        for frag in frags:
+            emote = frag.get("emote")
+            txt = str(frag.get("text") or "")
+            if emote and emote.get("emoteID"):
+                eid = str(emote["emoteID"])
+                runs.append(
+                    ChatRun(
+                        kind="emote",
+                        text=txt or f":{eid}:",
+                        emote_url=f"https://static-cdn.jtvnw.net/emoticons/v2/{eid}/default/dark/2.0",
+                    )
+                )
+                plain_parts.append(txt or f":{eid}:")
+            elif txt:
+                runs.append(ChatRun(kind="text", text=txt))
+                plain_parts.append(txt)
+
+        plain_text = "".join(plain_parts).strip()
+        if not plain_text and not runs:
+            continue
+        if ng_lower:
+            low = plain_text.lower()
+            if any(w in low for w in ng_lower):
+                continue
+
+        badges = msg.get("userBadges") or []
+        kind = "normal"
+        is_member = False
+        for b in badges:
+            sid = str(b.get("setID") or "").lower()
+            if sid == "broadcaster":
+                kind = "owner"
+                break
+            if sid == "moderator":
+                kind = "moderator"
+            elif sid in ("subscriber", "founder"):
+                is_member = True
+        if kind == "normal" and is_member:
+            kind = "member"
+
+        author = str(((node.get("commenter") or {}).get("displayName")) or "")
+        result.append(
+            ParsedChatItem(
+                item_id=str(node.get("id") or ""),
+                offset_sec=max(0.0, offset_sec - c_start),
+                kind=kind,
+                author=author,
+                runs=runs,
+                plain_text=plain_text,
+            )
+        )
+    result.sort(key=lambda x: x.offset_sec)
+    return result
+
+
 def parse_live_chat_json(
     json_path: str | Path,
     clip_start_sec: Optional[float] = None,
@@ -185,6 +412,16 @@ def parse_live_chat_json(
     first_ts_usec: Optional[int] = None
 
     ng_lower = [w.strip().lower() for w in (ng_words or []) if w.strip()]
+    c_start = float(clip_start_sec) if clip_start_sec is not None else 0.0
+    c_end = float(clip_end_sec) if clip_end_sec is not None else None
+
+    if path.name.endswith(".twitch_chat.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, dict) and payload.get("source") == "twitch":
+                return _parse_twitch_chat_payload(payload.get("comments") or [], c_start, c_end, ng_lower)
+        except Exception:
+            return []
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:

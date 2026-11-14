@@ -1,8 +1,8 @@
 {
   "name": "nicotube-studio",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
-  "description": "YouTube livestream/clip downloader with Niconico-authentic danmaku compositing and hardware-accelerated encoding.",
+  "description": "YouTube & Twitch livestream/clip downloader with Niconico-authentic danmaku compositing and hardware-accelerated encoding.",
   "main": "electron/main.cjs",
   "scripts": {
     "dev:vite": "vite --port 5173 --strictPort",
@@ -66,6 +66,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
     },
@@ -78,6 +80,7 @@
     "@fontsource/jetbrains-mono": "^5.3.0",
     "@fontsource/noto-sans-jp": "^5.3.1",
     "electron-updater": "^6.8.11",
+    "hls.js": "^1.7.4",
     "lucide-react": "^0.511.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

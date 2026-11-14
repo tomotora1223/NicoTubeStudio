@@ -124,6 +124,9 @@ export interface SharedStyleEntry {
   name: string
   author: string
   description: string
+  tags?: string[]
+  source?: string
+  url?: string | null
   created_at: number
   config: CommentStyleConfig
 }
@@ -132,7 +135,14 @@ export interface SharedStyleCreate {
   name: string
   author: string
   description: string
+  tags?: string[]
   config: CommentStyleConfig
+}
+
+export interface GithubStyleShareResult {
+  method: 'gist' | 'issue_url'
+  url: string
+  entry: SharedStyleEntry
 }
 
 export interface Preset {
@@ -160,6 +170,7 @@ export interface VideoInfoResponse {
   title: string
   uploader: string
   channel_id?: string | null
+  platform?: 'youtube' | 'twitch' | 'other' | string
   duration_sec: number
   is_live: boolean
   was_live: boolean
@@ -221,6 +232,8 @@ export interface AppSettings {
   auto_update_app: boolean
   update_feed_url: string
   style_server_url: string
+  github_style_token?: string
+  style_author_name?: string
   encode_config?: EncodeConfig
   last_comment_style?: CommentStyleConfig | null
 }

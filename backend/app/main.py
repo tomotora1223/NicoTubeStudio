@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import re
 import shutil
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
@@ -17,6 +21,7 @@ from pydantic import BaseModel
 
 from .config import (
     AUTH_META_FILE,
+    BASE_DIR,
     COOKIE_FILE,
     EMOTE_CACHE_DIR,
     SHARED_STYLES_FILE,
@@ -33,6 +38,7 @@ from .models import (
     AuthStatus,
     CommentStyleConfig,
     EncoderProbeResult,
+    GithubStyleShareResult,
     JobCreateRequest,
     Preset,
     PresetCreate,
@@ -184,6 +190,100 @@ def _save_local_shared_styles(items: list[SharedStyleEntry]) -> None:
     )
 
 
+DEFAULT_GITHUB_STYLES_URL = (
+    "https://raw.githubusercontent.com/tomotora1223/NicoTubeStudio/main/community-styles/index.json"
+)
+_COMMUNITY_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
+
+
+def _parse_style_list(raw: Any, default_source: str = "github") -> list[SharedStyleEntry]:
+    out: list[SharedStyleEntry] = []
+    if not isinstance(raw, list):
+        return out
+    for idx, x in enumerate(raw):
+        if not isinstance(x, dict):
+            continue
+        try:
+            cfg_raw = x.get("config") if "config" in x else x
+            entry = SharedStyleEntry(
+                id=str(x.get("id") or f"{default_source}-{idx}"),
+                name=str(x.get("name") or "共有スタイル"),
+                author=str(x.get("author") or "Community"),
+                description=str(x.get("description") or ""),
+                tags=[str(t) for t in (x.get("tags") or []) if t],
+                source=str(x.get("source") or default_source),
+                url=x.get("url"),
+                created_at=float(x.get("created_at") or time.time()),
+                config=CommentStyleConfig(**cfg_raw),
+            )
+            out.append(entry)
+        except Exception:
+            continue
+    return out
+
+
+def _load_bundled_community_styles() -> list[SharedStyleEntry]:
+    candidates = [
+        Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "community-styles" / "index.json",
+        BASE_DIR.parent / "community-styles" / "index.json",
+        BASE_DIR / "community-styles" / "index.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                parsed = _parse_style_list(raw, default_source="github")
+                if parsed:
+                    return parsed
+            except Exception:
+                pass
+    return []
+
+
+@app.get("/api/styles/community", response_model=list[SharedStyleEntry])
+async def list_community_styles(refresh: bool = False) -> list[SharedStyleEntry]:
+    now = time.monotonic()
+    github_items: list[SharedStyleEntry] = []
+    if not refresh and _COMMUNITY_CACHE["items"] and (now - _COMMUNITY_CACHE["ts"] < 180):
+        github_items = list(_COMMUNITY_CACHE["items"])
+    else:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+                resp = await client.get(DEFAULT_GITHUB_STYLES_URL)
+                if resp.status_code == 200:
+                    parsed = _parse_style_list(resp.json(), default_source="github")
+                    if parsed:
+                        github_items = parsed
+                        _COMMUNITY_CACHE["ts"] = now
+                        _COMMUNITY_CACHE["items"] = parsed
+        except Exception:
+            pass
+    if not github_items:
+        github_items = _load_bundled_community_styles()
+
+    remote_items: list[SharedStyleEntry] = []
+    settings = load_settings()
+    remote_base = (settings.style_server_url or "").strip().rstrip("/")
+    if remote_base:
+        try:
+            endpoint = remote_base if remote_base.endswith(".json") else f"{remote_base}/styles"
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+                resp = await client.get(endpoint)
+                if resp.status_code == 200:
+                    remote_items = _parse_style_list(resp.json(), default_source="relay")
+        except Exception:
+            pass
+
+    local_items = _load_local_shared_styles()
+    seen: set[str] = set()
+    merged: list[SharedStyleEntry] = []
+    for it in [*remote_items, *github_items, *local_items]:
+        if it.id not in seen:
+            seen.add(it.id)
+            merged.append(it)
+    return merged
+
+
 @app.get("/api/styles/shared", response_model=list[SharedStyleEntry])
 async def list_shared_styles() -> list[SharedStyleEntry]:
     local_items = _load_local_shared_styles()
@@ -196,11 +296,9 @@ async def list_shared_styles() -> list[SharedStyleEntry]:
         async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
             resp = await client.get(endpoint)
             if resp.status_code == 200:
-                raw = resp.json()
-                if isinstance(raw, list):
-                    remote_items = [SharedStyleEntry(**x) for x in raw]
-                    seen = {i.id for i in remote_items}
-                    return [*remote_items, *(x for x in local_items if x.id not in seen)]
+                remote_items = _parse_style_list(resp.json(), default_source="relay")
+                seen = {i.id for i in remote_items}
+                return [*remote_items, *(x for x in local_items if x.id not in seen)]
     except Exception:
         pass
     return local_items
@@ -213,6 +311,8 @@ async def publish_shared_style(payload: SharedStyleCreate) -> SharedStyleEntry:
         name=payload.name.strip() or "共有コメントスタイル",
         author=payload.author.strip() or "Anonymous",
         description=payload.description.strip(),
+        tags=[t.strip() for t in payload.tags if t.strip()][:6],
+        source="local",
         created_at=time.time(),
         config=payload.config,
     )
@@ -231,6 +331,82 @@ async def publish_shared_style(payload: SharedStyleCreate) -> SharedStyleEntry:
     return entry
 
 
+@app.post("/api/styles/share-github", response_model=GithubStyleShareResult)
+async def share_style_to_github(payload: SharedStyleCreate) -> GithubStyleShareResult:
+    settings = load_settings()
+    entry = SharedStyleEntry(
+        id=f"share-{uuid.uuid4().hex[:10]}",
+        name=payload.name.strip() or "共有コメントスタイル",
+        author=payload.author.strip() or settings.style_author_name.strip() or "Anonymous",
+        description=payload.description.strip(),
+        tags=[t.strip() for t in payload.tags if t.strip()][:6],
+        source="github",
+        created_at=time.time(),
+        config=payload.config,
+    )
+    style_doc = {
+        "id": entry.id,
+        "name": entry.name,
+        "author": entry.author,
+        "description": entry.description,
+        "tags": entry.tags,
+        "created_at": int(entry.created_at),
+        "config": entry.config.model_dump(),
+    }
+    json_body = json.dumps(style_doc, ensure_ascii=False, indent=2)
+
+    # Also store locally & push to custom relay if configured
+    items = _load_local_shared_styles()
+    items.insert(0, entry)
+    _save_local_shared_styles(items)
+    remote_base = (settings.style_server_url or "").strip().rstrip("/")
+    if remote_base and not remote_base.endswith(".json"):
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+                await client.post(f"{remote_base}/styles", json=payload.model_dump())
+        except Exception:
+            pass
+
+    token = (settings.github_style_token or "").strip()
+    if token:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+                resp = await client.post(
+                    "https://api.github.com/gists",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    json={
+                        "description": f"NicoTube Studio Comment Style: {entry.name} by {entry.author}",
+                        "public": True,
+                        "files": {
+                            f"{entry.id}.nicostyle.json": {"content": json_body},
+                        },
+                    },
+                )
+                resp.raise_for_status()
+                gist_data = resp.json()
+                gist_url = str(gist_data.get("html_url") or "")
+                entry.url = gist_url
+                return GithubStyleShareResult(method="gist", url=gist_url, entry=entry)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"GitHub Gist公開エラー: {exc}") from exc
+
+    issue_title = f"[Style] {entry.name}"
+    issue_body = (
+        f"### コメントスタイル共有リクエスト\n\n"
+        f"- 作成者: {entry.author}\n"
+        f"- 説明: {entry.description or 'なし'}\n"
+        f"- タグ: {', '.join(entry.tags) if entry.tags else 'なし'}\n\n"
+        f"```json\n{json_body[:5500]}\n```\n"
+    )
+    qs = urlencode({"title": issue_title, "body": issue_body})
+    issue_url = f"https://github.com/tomotora1223/NicoTubeStudio/issues/new?{qs}"
+    entry.url = issue_url
+    return GithubStyleShareResult(method="issue_url", url=issue_url, entry=entry)
+
+
 @app.delete("/api/styles/shared/{style_id}")
 async def delete_shared_style(style_id: str) -> dict[str, bool]:
     items = _load_local_shared_styles()
@@ -243,29 +419,68 @@ async def delete_shared_style(style_id: str) -> dict[str, bool]:
 
 @app.post("/api/styles/import-url", response_model=SharedStyleCreate)
 async def import_style_from_url(payload: StyleUrlImportRequest) -> SharedStyleCreate:
-    url = payload.url.strip()
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="http:// または https:// のURLを指定してください")
+    raw_input = payload.url.strip()
+    if raw_input.startswith("NTS1:"):
+        try:
+            decoded = json.loads(base64.b64decode(raw_input[5:].strip()).decode("utf-8"))
+            cfg = decoded.get("config") or decoded
+            return SharedStyleCreate(
+                name=str(decoded.get("name") or "共有コードスタイル"),
+                author="Share Code",
+                description="共有コードからインポート",
+                config=CommentStyleConfig(**cfg),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"共有コードの解析に失敗しました: {exc}") from exc
+
+    if not raw_input.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL (http:// / https://) または NTS1: コードを指定してください")
+
+    url = raw_input
+    # Support github.com/owner/repo/blob/... -> raw.githubusercontent.com
+    gh_blob = re.match(r"^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$", url)
+    if gh_blob:
+        url = f"https://raw.githubusercontent.com/{gh_blob.group(1)}/{gh_blob.group(2)}/{gh_blob.group(3)}"
+
+    # Support gist.github.com/<user>/<gist_id> -> api.github.com/gists/<gist_id>
+    gist_m = re.match(r"^https?://gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", url)
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
+            if gist_m:
+                resp = await client.get(f"https://api.github.com/gists/{gist_m.group(1)}")
+                resp.raise_for_status()
+                gist_json = resp.json()
+                files = gist_json.get("files") or {}
+                data = None
+                for fname, fmeta in files.items():
+                    if fname.endswith(".json") and isinstance(fmeta, dict) and fmeta.get("content"):
+                        data = json.loads(fmeta["content"])
+                        break
+                if data is None:
+                    raise ValueError("Gist内に有効なJSONスタイルファイルが見つかりません")
+            else:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"URLからの読込に失敗しました: {exc}") from exc
+
+    if isinstance(data, list) and data:
+        data = data[0]
 
     if isinstance(data, dict) and "config" in data:
         return SharedStyleCreate(
             name=str(data.get("name") or "インポートスタイル"),
             author=str(data.get("author") or "URL Import"),
-            description=str(data.get("description") or url),
+            description=str(data.get("description") or raw_input),
+            tags=[str(t) for t in (data.get("tags") or []) if t],
             config=CommentStyleConfig(**data["config"]),
         )
     if isinstance(data, dict):
         return SharedStyleCreate(
             name="インポートスタイル",
             author="URL Import",
-            description=url,
+            description=raw_input,
             config=CommentStyleConfig(**data),
         )
     raise HTTPException(status_code=400, detail="有効なスタイルJSON形式ではありません")

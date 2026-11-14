@@ -20,6 +20,7 @@
   --md-positive: #4cc38a;
   --md-warning: #e5a93c;
   --md-negative: #e5484d;
+  --md-error: #e5484d;
   --md-elevation-floating: 0 12px 32px rgba(0, 0, 0, 0.45);
 }
 
@@ -42,6 +43,7 @@
   --md-positive: #16a34a;
   --md-warning: #d97706;
   --md-negative: #dc2626;
+  --md-error: #dc2626;
   --md-elevation-floating: 0 8px 24px rgba(0, 0, 0, 0.08);
 }
 

@@ -176,6 +176,7 @@ class VideoInfoResponse(BaseModel):
     title: str
     uploader: str
     channel_id: Optional[str] = None
+    platform: str = "youtube"
     duration_sec: float = 0.0
     is_live: bool = False
     was_live: bool = False
@@ -247,6 +248,8 @@ class AppSettings(BaseModel):
     auto_update_app: bool = True
     update_feed_url: str = "tomotora1223/NicoTubeStudio"
     style_server_url: str = ""
+    github_style_token: str = ""
+    style_author_name: str = ""
     encode_config: EncodeConfig = Field(default_factory=EncodeConfig)
     last_comment_style: Optional[CommentStyleConfig] = None
 
@@ -263,6 +266,9 @@ class SharedStyleEntry(BaseModel):
     name: str
     author: str = "Anonymous"
     description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    source: str = "local"
+    url: Optional[str] = None
     created_at: float
     config: CommentStyleConfig
 
@@ -271,11 +277,18 @@ class SharedStyleCreate(BaseModel):
     name: str
     author: str = "Anonymous"
     description: str = ""
+    tags: list[str] = Field(default_factory=list)
     config: CommentStyleConfig
 
 
 class StyleUrlImportRequest(BaseModel):
     url: str
+
+
+class GithubStyleShareResult(BaseModel):
+    method: Literal["gist", "issue_url"]
+    url: str
+    entry: SharedStyleEntry
 
 
 class EncoderProbeResult(BaseModel):
