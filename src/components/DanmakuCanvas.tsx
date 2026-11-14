@@ -92,7 +92,12 @@ export function DanmakuCanvas({
       scheduledRef.current = scheduleSimComments(ctx, simComments, canvas.width, canvas.height, styleConfig)
     }
     runSchedule()
-    loadDynamicFontFace(styleConfig.font_family).then(runSchedule).catch(() => {})
+    loadDynamicFontFace(styleConfig.font_family)
+      .then(async () => {
+        if (document.fonts) await document.fonts.ready
+        runSchedule()
+      })
+      .catch(() => {})
     return () => {
       cancelled = true
     }

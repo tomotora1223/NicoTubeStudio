@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,8 +20,11 @@ from .ffmpeg_tools import (
     ensure_ffmpeg_in_path,
     get_audio_codec,
     get_media_start_time,
+    get_video_codec,
     get_video_metadata,
+    get_video_stream_start_time,
     resolve_ffmpeg_video_args,
+    resolve_hw_decode_args,
 )
 from .models import EncodeConfig, EncoderProbeResult, FormatOption, VideoInfoResponse
 from .tool_updater import detect_js_runtime
@@ -435,8 +438,14 @@ def _direct_ffmpeg_clip_download(
             out_mkv.unlink(missing_ok=True)
             return None
 
-    actual_start = get_media_start_time(str(out_mkv))
+    v_start = get_video_stream_start_time(str(out_mkv))
+    c_start = get_media_start_time(str(out_mkv))
+    actual_start = v_start if v_start is not None else c_start
+    _, _, _, clip_file_dur = get_video_metadata(str(out_mkv))
     trim_offset = max(0.0, s - actual_start)
+    if s > 5.0 and clip_file_dur > 0 and trim_offset >= max(0.5, clip_file_dur - 0.5):
+        out_mkv.unlink(missing_ok=True)
+        return None
     trim_duration = (clip_end_sec - s) if has_end else None
     if progress_cb:
         progress_cb(0.96, "切り抜き素材の取得が完了しました")
@@ -543,6 +552,30 @@ def download_video_and_chat(
         with yt_dlp.YoutubeDL(chat_opts) as cydl:
             cydl.download([url])
 
+    def _run_cancellable_pool(tasks: list[Callable[[], object]]) -> list[object]:
+        pool = ThreadPoolExecutor(max_workers=len(tasks))
+        futs = [pool.submit(fn) for fn in tasks]
+        pending = set(futs)
+        try:
+            while pending:
+                if cancel_check and cancel_check():
+                    for f in futs:
+                        f.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise RuntimeError("Cancelled by user")
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for df in done:
+                    df.result()
+            return [f.result() for f in futs]
+        except Exception:
+            for f in futs:
+                f.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            if not (cancel_check and cancel_check()):
+                pool.shutdown(wait=True)
+
     if is_clipped:
         if not ffmpeg_exe:
             raise RuntimeError("区間切り抜きにはFFmpegが必要ですが、見つかりません。設定画面からFFmpegを導入してください。")
@@ -558,10 +591,11 @@ def download_video_and_chat(
                 info = ydl.extract_info(url, download=False)
                 cj = ydl.cookiejar
 
-            with ThreadPoolExecutor(max_workers=2 if need_chat else 1) as dl_pool:
-                chat_fut = dl_pool.submit(dl_chat_worker) if need_chat else None
-                clip_fut = dl_pool.submit(
-                    _direct_ffmpeg_clip_download,
+            if cancel_check and cancel_check():
+                raise RuntimeError("Cancelled by user")
+
+            def _do_clip():
+                return _direct_ffmpeg_clip_download(
                     ffmpeg_exe,
                     info or {},
                     cj,
@@ -572,12 +606,15 @@ def download_video_and_chat(
                     cancel_check,
                     proc_hook,
                 )
-                direct = clip_fut.result()
-                if chat_fut:
-                    chat_fut.result()
+
+            tasks: list[Callable[[], object]] = [_do_clip]
+            if need_chat:
+                tasks.append(dl_chat_worker)
+            results = _run_cancellable_pool(tasks)
+            direct = results[0]
 
             if direct is not None:
-                video_path, trim_offset_sec, trim_duration_sec = direct
+                video_path, trim_offset_sec, trim_duration_sec = direct  # type: ignore[misc]
             else:
                 # Fallback to yt-dlp FFmpegFD stream copy (no CPU re-encode)
                 ydl_opts["download_ranges"] = download_range_func(None, [(s, e)])
@@ -585,12 +622,14 @@ def download_video_and_chat(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
         else:
-            with ThreadPoolExecutor(max_workers=2 if (need_chat and twitch_mode) else 1) as dl_pool:
-                chat_fut = dl_pool.submit(dl_chat_worker) if (need_chat and twitch_mode) else None
+            def _dl_full():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
-                if chat_fut:
-                    chat_fut.result()
+
+            tasks = [_dl_full]
+            if need_chat and twitch_mode:
+                tasks.append(dl_chat_worker)
+            _run_cancellable_pool(tasks)
     else:
         aria2c = _find_aria2c()
         if aria2c:
@@ -602,12 +641,15 @@ def download_video_and_chat(
                     "--file-allocation=none",
                 ]
             }
-        with ThreadPoolExecutor(max_workers=2 if (need_chat and twitch_mode) else 1) as dl_pool:
-            chat_fut = dl_pool.submit(dl_chat_worker) if (need_chat and twitch_mode) else None
+
+        def _dl_full_main():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            if chat_fut:
-                chat_fut.result()
+
+        tasks = [_dl_full_main]
+        if need_chat and twitch_mode:
+            tasks.append(dl_chat_worker)
+        _run_cancellable_pool(tasks)
 
     for p in sorted(work_dir.iterdir()):
         if p.name.endswith(".live_chat.json") or p.name.endswith(".twitch_chat.json"):
@@ -646,11 +688,18 @@ def transcode_video_only(
 
     src_ext = Path(source_video).suffix.lower().lstrip(".")
     has_trim = clip_offset_sec > 0 or (clip_duration_sec is not None and clip_duration_sec > 0)
+    src_vcodec = get_video_codec(source_video)
+    codec_matches = (
+        (encode.codec == "h264" and src_vcodec in ("h264", "avc1"))
+        or (encode.codec == "h265" and src_vcodec in ("hevc", "h265", "hvc1", "hev1"))
+        or (encode.codec == "av1" and src_vcodec in ("av1", "av01"))
+    )
+    container_args = ["-movflags", "+faststart"] if encode.container == "mp4" else []
 
-    if src_ext == encode.container and encode.max_fps == 0 and not has_trim:
+    if src_ext == encode.container and codec_matches and encode.max_fps == 0 and not has_trim:
         cmd = [
             ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-            "-i", source_video, "-c", "copy", "-movflags", "+faststart", output_video,
+            "-i", source_video, "-c", "copy", *container_args, output_video,
         ]
         copy_proc = subprocess.Popen(
             cmd,
@@ -681,6 +730,7 @@ def transcode_video_only(
     enc_args = resolve_ffmpeg_video_args(
         encode.codec, encode.hw_encoder, encode.quality_cq, encode.preset_speed, probe
     )
+    hw_dec_args = resolve_hw_decode_args(encode.hw_encoder, probe)
     clip_in_args: list[str] = []
     if clip_offset_sec > 0:
         clip_in_args += ["-ss", f"{clip_offset_sec:.3f}"]
@@ -689,89 +739,94 @@ def transcode_video_only(
 
     vf_args = ["-vf", f"fps={encode.max_fps}"] if encode.max_fps > 0 else []
     src_audio_codec = get_audio_codec(source_video)
-    audio_args = (
-        ["-c:a", "copy"]
-        if (encode.container == "mkv" or src_audio_codec == "aac")
-        else ["-c:a", "aac", "-b:a", "192k"]
-    )
-    cmd = [
-        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-        "-threads", "0", "-stats_period", "0.5", "-progress", "pipe:1",
-        *clip_in_args,
-        "-i", source_video, *vf_args, *enc_args, *audio_args, "-movflags", "+faststart", output_video,
-    ]
+    can_copy_audio = (encode.container == "mkv" or src_audio_codec == "aac") and clip_offset_sec <= 0.05
+    audio_args = ["-c:a", "copy"] if can_copy_audio else ["-c:a", "aac", "-b:a", "192k"]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if proc_hook:
-        proc_hook(proc, True)
-    stderr_chunks: list[bytes] = []
+    def _run_transcode(in_hw_args: list[str]) -> tuple[int, str]:
+        cmd = [
+            ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", "0", "-stats_period", "0.5", "-progress", "pipe:1",
+            *in_hw_args,
+            *clip_in_args,
+            "-i", source_video, *vf_args, *enc_args, *audio_args, *container_args, output_video,
+        ]
 
-    def drain_err() -> None:
-        if proc.stderr is None:
-            return
-        while True:
-            chunk = proc.stderr.read(4096)
-            if not chunk:
-                break
-            if len(stderr_chunks) < 16:
-                stderr_chunks.append(chunk)
-
-    err_thread = threading.Thread(target=drain_err, daemon=True)
-    err_thread.start()
-    start_wall = time.monotonic()
-    total_us = max(1.0, target_dur * 1_000_000.0)
-    cur_fps = 0.0
-    cur_speed = ""
-    out_us = 0
-
-    try:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            if cancel_event and cancel_event.is_set():
-                proc.terminate()
-                raise RuntimeError("ジョブがキャンセルされました")
-            line = raw_line.decode("utf-8", errors="ignore").strip()
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k == "fps":
-                try:
-                    cur_fps = float(v)
-                except Exception:
-                    pass
-            elif k == "speed":
-                cur_speed = v
-            elif k == "out_time_us":
-                try:
-                    out_us = int(v)
-                except Exception:
-                    pass
-            elif k == "progress" and progress_cb:
-                pct = min(0.99, max(0.0, out_us / total_us))
-                elapsed = max(0.1, time.monotonic() - start_wall)
-                eta = int((elapsed / pct) * (1.0 - pct)) if pct > 0.02 else None
-                progress_cb(pct, cur_fps, cur_speed, eta)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        raise
-    finally:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         if proc_hook:
-            proc_hook(proc, False)
+            proc_hook(proc, True)
+        stderr_chunks: list[bytes] = []
 
-    ret = proc.wait()
-    err_thread.join(timeout=1.0)
+        def drain_err() -> None:
+            if proc.stderr is None:
+                return
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                if len(stderr_chunks) < 16:
+                    stderr_chunks.append(chunk)
+
+        err_thread = threading.Thread(target=drain_err, daemon=True)
+        err_thread.start()
+        start_wall = time.monotonic()
+        total_us = max(1.0, target_dur * 1_000_000.0)
+        cur_fps = 0.0
+        cur_speed = ""
+        out_us = 0
+
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                if cancel_event and cancel_event.is_set():
+                    proc.terminate()
+                    raise RuntimeError("ジョブがキャンセルされました")
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k == "fps":
+                    try:
+                        cur_fps = float(v)
+                    except Exception:
+                        pass
+                elif k == "speed":
+                    cur_speed = v
+                elif k == "out_time_us":
+                    try:
+                        out_us = int(v)
+                    except Exception:
+                        pass
+                elif k == "progress" and progress_cb:
+                    pct = min(0.99, max(0.0, out_us / total_us))
+                    elapsed = max(0.1, time.monotonic() - start_wall)
+                    eta = int((elapsed / pct) * (1.0 - pct)) if pct > 0.02 else None
+                    progress_cb(pct, cur_fps, cur_speed, eta)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+        finally:
+            if proc_hook:
+                proc_hook(proc, False)
+
+        ret = proc.wait()
+        err_thread.join(timeout=1.0)
+        err = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
+        return ret, err
+
+    ret, err = _run_transcode(hw_dec_args)
+    if ret != 0 and hw_dec_args and not (cancel_event and cancel_event.is_set()):
+        ret, err = _run_transcode([])
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("ジョブがキャンセルされました")
     if ret != 0:
-        err = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
         raise RuntimeError(f"FFmpeg出力エラー (code {ret}): {err[-400:]}")
 
 

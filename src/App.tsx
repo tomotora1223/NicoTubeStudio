@@ -79,7 +79,9 @@ export default function App() {
         setEncodeConfig({ ...DEFAULT_ENCODE_CONFIG, ...s.encode_config })
       }
       const chosen = pList.find((p) => p.id === s.active_preset_id) || pList[0]
-      if (chosen) {
+      if (s.active_preset_id === 'custom' && s.last_comment_style) {
+        setActivePresetId('custom')
+      } else if (chosen) {
         setActivePresetId(chosen.id)
       }
       if (s.last_comment_style) {
@@ -274,6 +276,10 @@ export default function App() {
   }
 
   const handleUpdateSettings = async (next: AppSettings) => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
     const merged: AppSettings = {
       ...next,
       encode_config: next.encode_config ?? settingsRef.current.encode_config,
@@ -355,13 +361,17 @@ export default function App() {
         <div className={activeTab === 'gallery' ? 'block' : 'hidden'}>
           <CommunityStylesView
             currentStyle={commentStyle}
-            activePresetName={presets.find((p) => p.id === activePresetId)?.name || '現在の調整スタイル'}
+            activePresetName={
+              presets.find((p) => p.id === activePresetId)?.name || 'カスタム調整スタイル'
+            }
             thumbnailUrl={previewThumb}
             defaultAuthorName={settings.style_author_name}
             hasRelayServer={Boolean(settings.style_server_url?.trim())}
             hasGithubToken={Boolean(settings.github_style_token?.trim())}
             onApplyStyle={(cfg, openStudio) => {
-              handleChangeCommentStyle(cfg)
+              setActivePresetId('custom')
+              setCommentStyle(cfg)
+              persistSettingsPatch({ active_preset_id: 'custom', last_comment_style: cfg })
               if (openStudio) setActiveTab('comments')
             }}
             onSaveAsPreset={handleCreatePreset}

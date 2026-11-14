@@ -104,6 +104,10 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
               (req.clip_start_sec !== null && req.clip_start_sec !== undefined) ||
               (req.clip_end_sec !== null && req.clip_end_sec !== undefined)
 
+            const primaryFile =
+              job.output_files.find((f) => /\.(mp4|mkv|webm|mov)$/i.test(f)) ||
+              job.output_files[0]
+
             return (
               <div
                 key={job.id}
@@ -151,11 +155,11 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
 
                   {/* Action Buttons */}
                   <div className="flex items-center gap-1.5">
-                    {job.status === 'completed' && job.output_files[0] && (
+                    {job.status === 'completed' && primaryFile && (
                       <>
                         <button
                           type="button"
-                          onClick={() => window.nicotube?.openPath(job.output_files[0])}
+                          onClick={() => window.nicotube?.openPath(primaryFile)}
                           className="flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium"
                           style={{
                             backgroundColor: 'var(--md-surface-high)',
@@ -168,7 +172,7 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
                         </button>
                         <button
                           type="button"
-                          onClick={() => window.nicotube?.showInFolder(job.output_files[0])}
+                          onClick={() => window.nicotube?.showInFolder(primaryFile)}
                           className="flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium"
                           style={{
                             backgroundColor: 'var(--md-surface-high)',
@@ -284,12 +288,63 @@ export function QueueView({ jobs, onRefresh }: QueueViewProps) {
                   )}
 
                   {job.output_files.length > 0 && (
-                    <div className="font-mono-tabular flex flex-col gap-0.5 text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                      {job.output_files.map((f) => (
-                        <div key={f} className="truncate">
-                          {f}
-                        </div>
-                      ))}
+                    <div className="flex flex-col gap-1 pt-0.5">
+                      {job.output_files.map((f) => {
+                        const fileName = f.split(/[/\\]/).pop() || f
+                        const extBadge = (fileName.split('.').pop() || '').toUpperCase()
+                        return (
+                          <div
+                            key={f}
+                            className="flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-[11px]"
+                            style={{
+                              backgroundColor: 'var(--md-surface)',
+                              borderColor: 'var(--md-outline-variant)',
+                              color: 'var(--md-on-surface-muted)',
+                            }}
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              {extBadge && (
+                                <span
+                                  className="font-mono-tabular shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+                                  style={{
+                                    backgroundColor: 'var(--md-surface-high)',
+                                    color: 'var(--md-on-surface-variant)',
+                                  }}
+                                >
+                                  {extBadge}
+                                </span>
+                              )}
+                              <span className="font-mono-tabular truncate" title={f}>
+                                {fileName}
+                              </span>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => window.nicotube?.openPath(f)}
+                                className="rounded px-2 py-0.5 text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--md-surface-high)',
+                                  color: 'var(--md-on-surface)',
+                                }}
+                              >
+                                開く
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => window.nicotube?.showInFolder(f)}
+                                className="rounded px-2 py-0.5 text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--md-surface-high)',
+                                  color: 'var(--md-on-surface-variant)',
+                                }}
+                              >
+                                場所
+                              </button>
+                            </div>
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
                 </div>

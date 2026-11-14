@@ -9,8 +9,10 @@ import {
   Loader2,
   Maximize2,
   MessageSquare,
+  Pause,
   Play,
   Plus,
+  Repeat,
   Scissors,
   Search,
   SlidersHorizontal,
@@ -70,6 +72,8 @@ export function CaptureWorkspace({
   const [customFilename, setCustomFilename] = useState('')
   const [showRangePreview, setShowRangePreview] = useState(true)
   const [previewCurrentSec, setPreviewCurrentSec] = useState(0)
+  const [previewPlaying, setPreviewPlaying] = useState(false)
+  const [loopSegment, setLoopSegment] = useState(false)
 
   const [submitting, setSubmitting] = useState(false)
   const [queuedNotice, setQueuedNotice] = useState<string | null>(null)
@@ -127,19 +131,44 @@ export function CaptureWorkspace({
     setClipEnd(clamped)
   }
 
-  const seekPreviewTo = (sec: number) => {
+  const seekPreviewTo = (sec: number, autoPlay = false) => {
     const vid = clipVideoRef.current
     if (!vid) return
     const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : totalDur
-    vid.currentTime = Math.max(0, Math.min(sec, dur))
+    const target = Math.max(0, Math.min(sec, dur))
+    vid.currentTime = target
+    setPreviewCurrentSec(target)
+    if (autoPlay) {
+      vid.play().catch(() => {})
+    }
+  }
+
+  const togglePlayPreview = () => {
+    const vid = clipVideoRef.current
+    if (!vid) return
+    if (vid.paused) {
+      if (vid.currentTime < clipStart || vid.currentTime >= clipEnd) {
+        vid.currentTime = clipStart
+      }
+      vid.play().catch(() => {})
+    } else {
+      vid.pause()
+    }
+  }
+
+  const stepPreview = (deltaSec: number) => {
+    const cur = clipVideoRef.current?.currentTime ?? previewCurrentSec
+    seekPreviewTo(cur + deltaSec)
   }
 
   const setFromPreviewTime = (target: 'start' | 'end') => {
     const cur = Math.floor(clipVideoRef.current?.currentTime ?? previewCurrentSec)
     if (target === 'start') {
-      setClipStart(Math.min(cur, Math.max(0, clipEnd - 1)))
+      const nextStart = Math.min(cur, Math.max(0, clipEnd - 1))
+      setClipStart(nextStart)
     } else {
-      setClipEnd(Math.max(cur, clipStart + 1))
+      const nextEnd = Math.max(cur, clipStart + 1)
+      setClipEnd(nextEnd)
     }
   }
 
@@ -182,7 +211,10 @@ export function CaptureWorkspace({
   useEffect(() => {
     const vid = clipVideoRef.current
     const srcUrl = videoInfo?.preview_stream_url
-    if (!vid || !srcUrl) return
+    if (!clipEnabled || !showRangePreview || !vid || !srcUrl) {
+      setPreviewPlaying(false)
+      return
+    }
 
     let hls: Hls | null = null
     if (srcUrl.includes('.m3u8') && Hls.isSupported()) {
@@ -197,8 +229,11 @@ export function CaptureWorkspace({
       if (hls) {
         hls.destroy()
       }
+      vid.pause()
+      vid.removeAttribute('src')
+      vid.load()
     }
-  }, [videoInfo?.preview_stream_url, showRangePreview])
+  }, [videoInfo?.preview_stream_url, showRangePreview, clipEnabled])
 
   return (
     <div className="mx-auto flex w-full max-w-[1320px] flex-col gap-6 px-8 py-6">
@@ -436,6 +471,252 @@ export function CaptureWorkspace({
 
             {clipEnabled ? (
               <div className="flex flex-col gap-4">
+                {videoInfo?.preview_stream_url ? (
+                  <div
+                    className="flex flex-col gap-3 rounded-xl border p-3"
+                    style={{
+                      backgroundColor: 'var(--md-surface)',
+                      borderColor: 'var(--md-outline-variant)',
+                    }}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-[12px]">
+                        <Play size={13} strokeWidth={1.5} style={{ color: 'var(--md-primary)' }} />
+                        <span className="font-medium" style={{ color: 'var(--md-on-surface)' }}>
+                          ビジュアル切り抜きトリマー
+                        </span>
+                        <span className="font-mono-tabular text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                          現在 {formatDuration(Math.floor(previewCurrentSec))} / {formatDuration(totalDur)}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowRangePreview((v) => !v)}
+                        className="text-[11px] font-medium"
+                        style={{ color: 'var(--md-on-surface-muted)' }}
+                      >
+                        {showRangePreview ? 'プレイヤーを隠す' : 'プレイヤーを表示'}
+                      </button>
+                    </div>
+
+                    {showRangePreview && (
+                      <>
+                        <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
+                          <video
+                            ref={clipVideoRef}
+                            controls
+                            preload="metadata"
+                            onPlay={() => setPreviewPlaying(true)}
+                            onPause={() => setPreviewPlaying(false)}
+                            onTimeUpdate={(e) => {
+                              const cur = e.currentTarget.currentTime
+                              setPreviewCurrentSec(cur)
+                              if (loopSegment && clipEnd > clipStart && cur >= clipEnd) {
+                                e.currentTarget.currentTime = clipStart
+                                e.currentTarget.play().catch(() => {})
+                              }
+                            }}
+                            className="h-full w-full object-contain"
+                          />
+                          <div
+                            className="font-mono-tabular pointer-events-none absolute top-2.5 left-2.5 flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px]"
+                            style={{ backgroundColor: 'rgba(15,15,16,0.78)', color: '#ededed' }}
+                          >
+                            <span>IN {formatDuration(clipStart)}</span>
+                            <span style={{ color: '#85858b' }}>→</span>
+                            <span>OUT {formatDuration(clipEnd)}</span>
+                            <span style={{ color: '#f59c97' }}>({formatDuration(clipSpan)})</span>
+                          </div>
+                        </div>
+
+                        {/* Unified Dual-Handle Timeline Scrubber */}
+                        {totalDur > 1 && (
+                          <div className="flex flex-col gap-1.5 px-1">
+                            <div className="relative flex h-8 items-center">
+                              {/* Track Rail */}
+                              <div
+                                className="h-2 w-full rounded-full"
+                                style={{ backgroundColor: 'var(--md-surface-highest)' }}
+                              />
+                              {/* Active Selected Span */}
+                              <div
+                                className="pointer-events-none absolute h-2 rounded-full"
+                                style={{
+                                  left: `${(clipStart / totalDur) * 100}%`,
+                                  width: `${Math.max(1, ((clipEnd - clipStart) / totalDur) * 100)}%`,
+                                  backgroundColor: 'var(--md-primary)',
+                                  opacity: 0.85,
+                                }}
+                              />
+                              {/* Real-time Playhead Marker */}
+                              <div
+                                className="pointer-events-none absolute top-0.5 bottom-0.5 z-10 w-0.5 rounded-full"
+                                style={{
+                                  left: `${Math.max(0, Math.min(100, (previewCurrentSec / totalDur) * 100))}%`,
+                                  backgroundColor: '#fafafa',
+                                  boxShadow: '0 0 0 1px rgba(0,0,0,0.45)',
+                                }}
+                              />
+                              {/* Layered Dual Range Inputs */}
+                              <input
+                                type="range"
+                                aria-label="切り抜き開始位置"
+                                min={0}
+                                max={Math.max(1, totalDur - 1)}
+                                value={clipStart}
+                                onChange={(e) => {
+                                  const v = Math.min(Number(e.target.value), Math.max(0, clipEnd - 1))
+                                  setClipStart(v)
+                                  seekPreviewTo(v)
+                                }}
+                                className="trim-range-input z-20"
+                              />
+                              <input
+                                type="range"
+                                aria-label="切り抜き終了位置"
+                                min={1}
+                                max={totalDur}
+                                value={clipEnd}
+                                onChange={(e) => {
+                                  const v = Math.max(Number(e.target.value), clipStart + 1)
+                                  setClipEnd(v)
+                                  seekPreviewTo(v)
+                                }}
+                                className="trim-range-input trim-end z-20"
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Precision Nudge & In/Out Toolbar */}
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-1">
+                            {[
+                              [-10, '-10s'],
+                              [-1, '-1s'],
+                            ].map(([delta, lbl]) => (
+                              <button
+                                key={String(lbl)}
+                                type="button"
+                                onClick={() => stepPreview(Number(delta))}
+                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--md-surface-high)',
+                                  borderColor: 'var(--md-outline-variant)',
+                                  color: 'var(--md-on-surface-variant)',
+                                }}
+                              >
+                                {lbl}
+                              </button>
+                            ))}
+                            <button
+                              type="button"
+                              onClick={togglePlayPreview}
+                              className="flex h-7 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-medium"
+                              style={{
+                                backgroundColor: 'var(--md-surface-highest)',
+                                borderColor: 'var(--md-outline-variant)',
+                                color: 'var(--md-on-surface)',
+                              }}
+                            >
+                              {previewPlaying ? <Pause size={12} /> : <Play size={12} />}
+                              <span>{previewPlaying ? '停止' : '再生'}</span>
+                            </button>
+                            {[
+                              [1, '+1s'],
+                              [10, '+10s'],
+                            ].map(([delta, lbl]) => (
+                              <button
+                                key={String(lbl)}
+                                type="button"
+                                onClick={() => stepPreview(Number(delta))}
+                                className="font-mono-tabular h-7 rounded-lg border px-2 text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--md-surface-high)',
+                                  borderColor: 'var(--md-outline-variant)',
+                                  color: 'var(--md-on-surface-variant)',
+                                }}
+                              >
+                                {lbl}
+                              </button>
+                            ))}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setFromPreviewTime('start')}
+                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
+                              style={{
+                                backgroundColor: 'var(--md-primary-tonal)',
+                                borderColor: 'var(--md-primary)',
+                                color: 'var(--md-on-primary-tonal)',
+                              }}
+                            >
+                              [ ここを開始に
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setFromPreviewTime('end')}
+                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
+                              style={{
+                                backgroundColor: 'var(--md-surface-high)',
+                                borderColor: 'var(--md-outline-variant)',
+                                color: 'var(--md-on-surface)',
+                              }}
+                            >
+                              ここを終了に ]
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => seekPreviewTo(clipStart, true)}
+                              className="h-7 rounded-lg border px-2 text-[11px]"
+                              style={{
+                                backgroundColor: 'var(--md-surface-high)',
+                                borderColor: 'var(--md-outline-variant)',
+                                color: 'var(--md-on-surface-variant)',
+                              }}
+                            >
+                              頭出し
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => seekPreviewTo(Math.max(clipStart, clipEnd - 3), true)}
+                              className="h-7 rounded-lg border px-2 text-[11px]"
+                              style={{
+                                backgroundColor: 'var(--md-surface-high)',
+                                borderColor: 'var(--md-outline-variant)',
+                                color: 'var(--md-on-surface-variant)',
+                              }}
+                            >
+                              末尾確認
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setLoopSegment((v) => !v)}
+                              className="flex h-7 items-center gap-1 rounded-lg border px-2 text-[11px]"
+                              style={{
+                                backgroundColor: loopSegment ? 'var(--md-primary-tonal)' : 'var(--md-surface-high)',
+                                borderColor: loopSegment ? 'var(--md-primary)' : 'var(--md-outline-variant)',
+                                color: loopSegment ? 'var(--md-on-primary-tonal)' : 'var(--md-on-surface-muted)',
+                              }}
+                            >
+                              <Repeat size={11} strokeWidth={1.6} />
+                              <span>ループ</span>
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  videoInfo && (
+                    <div className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                      プレビュー用映像ストリームが取得できない動画のため、下のタイムコード入力で区間を指定してください
+                    </div>
+                  )
+                )}
+
                 <div className="grid grid-cols-3 gap-3">
                   <div className="flex flex-col gap-1">
                     <label className="text-[12px]" style={{ color: 'var(--md-on-surface-muted)' }}>
@@ -489,141 +770,6 @@ export function CaptureWorkspace({
                     </div>
                   </div>
                 </div>
-
-                {totalDur > 1 && (
-                  <div className="flex flex-col gap-2">
-                    <div className="flex items-center gap-3 text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                      <span className="w-10">開始</span>
-                      <input
-                        type="range"
-                        min={0}
-                        max={Math.max(1, totalDur - 1)}
-                        value={clipStart}
-                        onChange={(e) => {
-                          const v = Math.min(Number(e.target.value), Math.max(0, clipEnd - 1))
-                          setClipStart(v)
-                          seekPreviewTo(v)
-                        }}
-                        className="m3-slider flex-1"
-                      />
-                    </div>
-                    <div className="flex items-center gap-3 text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                      <span className="w-10">終了</span>
-                      <input
-                        type="range"
-                        min={1}
-                        max={totalDur}
-                        value={clipEnd}
-                        onChange={(e) => {
-                          const v = Math.max(Number(e.target.value), clipStart + 1)
-                          setClipEnd(v)
-                          seekPreviewTo(v)
-                        }}
-                        className="m3-slider flex-1"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {videoInfo?.preview_stream_url ? (
-                  <div
-                    className="flex flex-col gap-2.5 rounded-xl border p-3"
-                    style={{
-                      backgroundColor: 'var(--md-surface)',
-                      borderColor: 'var(--md-outline-variant)',
-                    }}
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 text-[12px]">
-                        <Play size={13} strokeWidth={1.5} style={{ color: 'var(--md-on-surface-muted)' }} />
-                        <span style={{ color: 'var(--md-on-surface-variant)' }}>切り抜き位置プレビュー</span>
-                        <span className="font-mono-tabular text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                          現在 {formatDuration(previewCurrentSec)}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setShowRangePreview((v) => !v)}
-                        className="text-[11px] font-medium"
-                        style={{ color: 'var(--md-on-surface-muted)' }}
-                      >
-                        {showRangePreview ? '折りたたむ' : 'プレビューを表示'}
-                      </button>
-                    </div>
-
-                    {showRangePreview && (
-                      <>
-                        <div className="mx-auto aspect-video w-full max-w-[460px] overflow-hidden rounded-lg bg-black">
-                          <video
-                            ref={clipVideoRef}
-                            controls
-                            preload="metadata"
-                            onTimeUpdate={(e) => setPreviewCurrentSec(Math.floor(e.currentTarget.currentTime))}
-                            className="h-full w-full object-contain"
-                          />
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => seekPreviewTo(clipStart)}
-                            className="h-7 rounded-lg border px-2.5 text-[11px]"
-                            style={{
-                              backgroundColor: 'var(--md-surface-high)',
-                              borderColor: 'var(--md-outline-variant)',
-                              color: 'var(--md-on-surface-variant)',
-                            }}
-                          >
-                            開始位置を確認
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => seekPreviewTo(clipEnd)}
-                            className="h-7 rounded-lg border px-2.5 text-[11px]"
-                            style={{
-                              backgroundColor: 'var(--md-surface-high)',
-                              borderColor: 'var(--md-outline-variant)',
-                              color: 'var(--md-on-surface-variant)',
-                            }}
-                          >
-                            終了位置を確認
-                          </button>
-                          <div className="ml-auto flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => setFromPreviewTime('start')}
-                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
-                              style={{
-                                backgroundColor: 'var(--md-primary-tonal)',
-                                borderColor: 'var(--md-primary)',
-                                color: 'var(--md-on-primary-tonal)',
-                              }}
-                            >
-                              再生位置 → 開始
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setFromPreviewTime('end')}
-                              className="h-7 rounded-lg border px-2.5 text-[11px] font-medium"
-                              style={{
-                                backgroundColor: 'var(--md-surface-high)',
-                                borderColor: 'var(--md-outline-variant)',
-                                color: 'var(--md-on-surface)',
-                              }}
-                            >
-                              再生位置 → 終了
-                            </button>
-                          </div>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                ) : (
-                  videoInfo && (
-                    <div className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
-                      プレビュー用プログレッシブ映像が取得できない動画のため、タイムコードまたはスライダーで区間を指定してください
-                    </div>
-                  )
-                )}
 
                 <p className="text-[12px]" style={{ color: 'var(--md-on-surface-muted)' }}>
                   コメントのタイムスタンプも切り抜き開始時刻に合わせて自動シフトされ、範囲内のチャットのみが合成されます
@@ -679,6 +825,11 @@ export function CaptureWorkspace({
                   )
                 })}
               </div>
+              {encodeConfig.output_mode === 'video_only' && (
+                <p className="text-[11px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+                  ※ 元動画とコンテナ・コーデックが一致し FPS制限なし・全編時は無劣化高速コピーします
+                </p>
+              )}
             </div>
 
             {/* Comment Style Preset Selector (directly under synthesis mode) */}
@@ -710,6 +861,11 @@ export function CaptureWorkspace({
                   color: 'var(--md-on-surface)',
                 }}
               >
+                {activePresetId === 'custom' && (
+                  <option value="custom" disabled>
+                    カスタム調整スタイル
+                  </option>
+                )}
                 {presets.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}

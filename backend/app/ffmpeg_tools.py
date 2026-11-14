@@ -337,6 +337,79 @@ def get_audio_codec(video_path: str) -> str:
         return ""
 
 
+def get_video_codec(video_path: str) -> str:
+    """Return the first video stream codec_name (lowercase), or empty string."""
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return ""
+    cmd = [
+        ffprobe,
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return (res.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def get_video_stream_start_time(video_path: str) -> Optional[float]:
+    """Return video stream start_time in seconds if available."""
+    ffprobe = find_ffprobe()
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe,
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=start_time",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        val = (res.stdout or "").strip()
+        if not val or val.upper() == "N/A":
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def resolve_hw_decode_args(hw_encoder: str, probe: EncoderProbeResult) -> list[str]:
+    """Enable FFmpeg GPU hardware decode when encoding on GPU."""
+    chosen = probe.recommended_hw if hw_encoder == "auto" else hw_encoder
+    if chosen in ("nvenc", "qsv", "amf") and chosen in probe.available_hw:
+        return ["-hwaccel", "auto"]
+    return []
+
+
 def get_media_start_time(video_path: str) -> float:
     """Return container format start_time in seconds (useful after -c copy -copyts)."""
     ffprobe = find_ffprobe()

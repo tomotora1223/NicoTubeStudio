@@ -98,7 +98,9 @@ async def get_settings() -> AppSettings:
 
 @app.put("/api/settings", response_model=AppSettings)
 async def update_settings(payload: AppSettings) -> AppSettings:
-    return save_settings(payload)
+    saved = save_settings(payload)
+    queue_manager.notify_concurrency_changed()
+    return saved
 
 
 @app.get("/api/presets", response_model=list[Preset])

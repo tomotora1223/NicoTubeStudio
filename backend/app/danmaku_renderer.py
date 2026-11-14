@@ -14,7 +14,13 @@ import numpy as np
 import skia
 
 from .chat_parser import ChatRun, ParsedChatItem, YOUTUBE_SUPERCHAT_TIERS, _contrast_text_for_bg
-from .ffmpeg_tools import find_ffmpeg, get_audio_codec, get_video_metadata, resolve_ffmpeg_video_args
+from .ffmpeg_tools import (
+    find_ffmpeg,
+    get_audio_codec,
+    get_video_metadata,
+    resolve_ffmpeg_video_args,
+    resolve_hw_decode_args,
+)
 from .fonts import resolve_typeface_file
 from .models import (
     DEFAULT_SUPERCHAT_TIER_COLORS,
@@ -634,13 +640,12 @@ def burn_danmaku_with_ffmpeg(
     enc_args = resolve_ffmpeg_video_args(
         encode.codec, encode.hw_encoder, encode.quality_cq, encode.preset_speed, probe
     )
+    hw_dec_args = resolve_hw_decode_args(encode.hw_encoder, probe)
 
     src_audio_codec = get_audio_codec(source_video)
-    audio_args = (
-        ["-c:a", "copy"]
-        if (encode.container == "mkv" or src_audio_codec == "aac")
-        else ["-c:a", "aac", "-b:a", "192k"]
-    )
+    can_copy_audio = (encode.container == "mkv" or src_audio_codec == "aac") and clip_offset_sec <= 0.05
+    audio_args = ["-c:a", "copy"] if can_copy_audio else ["-c:a", "aac", "-b:a", "192k"]
+    container_args = ["-movflags", "+faststart"] if encode.container == "mp4" else []
 
     clip_in_args: list[str] = []
     if clip_offset_sec > 0:
@@ -648,216 +653,230 @@ def burn_danmaku_with_ffmpeg(
     if clip_duration_sec is not None and clip_duration_sec > 0:
         clip_in_args += ["-t", f"{clip_duration_sec:.3f}"]
 
-    cmd = [
-        ffmpeg_exe,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-threads",
-        "0",
-        "-progress",
-        "pipe:1",
-        *clip_in_args,
-        "-i",
-        source_video,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgra",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        f"{fps:.6f}",
-        "-i",
-        "pipe:0",
-        "-filter_complex",
-        f"[0:v]fps={fps:.6f},format=yuv420p[bg];[1:v]format=bgra[ov];[bg][ov]overlay=0:0:shortest=1:alpha=premultiplied[v]",
-        "-map",
-        "[v]",
-        "-map",
-        "0:a?",
-        *enc_args,
-        *audio_args,
-        "-movflags",
-        "+faststart",
-        output_video,
-    ]
+    def _run_pass(in_hw_args: list[str]) -> tuple[int, str]:
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "0",
+            "-progress",
+            "pipe:1",
+            *in_hw_args,
+            *clip_in_args,
+            "-i",
+            source_video,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "pipe:0",
+            "-filter_complex",
+            f"[0:v]fps={fps:.6f},format=yuv420p[bg];[1:v]format=bgra[ov];[bg][ov]overlay=0:0:shortest=1:alpha=premultiplied[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "0:a?",
+            *enc_args,
+            *audio_args,
+            *container_args,
+            output_video,
+        ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=8 * 1024 * 1024,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    if proc_hook:
-        proc_hook(proc, True)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=8 * 1024 * 1024,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc_hook:
+            proc_hook(proc, True)
 
-    # Read ffmpeg -progress pipe:1 and stderr in background threads
-    latest_stats = {"fps": 0.0, "speed": "", "out_us": 0}
-    stderr_chunks: list[bytes] = []
+        # Read ffmpeg -progress pipe:1 and stderr in background threads
+        latest_stats = {"fps": 0.0, "speed": "", "out_us": 0}
+        stderr_chunks: list[bytes] = []
 
-    def read_progress() -> None:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="ignore").strip()
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k == "fps":
-                try:
-                    latest_stats["fps"] = float(v)
-                except Exception:
-                    pass
-            elif k == "speed":
-                latest_stats["speed"] = v
-            elif k == "out_time_us":
-                try:
-                    latest_stats["out_us"] = int(v)
-                except Exception:
-                    pass
+        def read_progress() -> None:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k == "fps":
+                    try:
+                        latest_stats["fps"] = float(v)
+                    except Exception:
+                        pass
+                elif k == "speed":
+                    latest_stats["speed"] = v
+                elif k == "out_time_us":
+                    try:
+                        latest_stats["out_us"] = int(v)
+                    except Exception:
+                        pass
 
-    def drain_err() -> None:
-        if proc.stderr is None:
-            return
-        while True:
-            chunk = proc.stderr.read(4096)
-            if not chunk:
-                break
-            if len(stderr_chunks) < 16:
-                stderr_chunks.append(chunk)
-
-    prog_thread = threading.Thread(target=read_progress, daemon=True)
-    err_thread = threading.Thread(target=drain_err, daemon=True)
-    prog_thread.start()
-    err_thread.start()
-
-    # Prepare frame buffer backed by numpy + Skia surface, plus async pipe writer
-    frame_buf = np.zeros((height, width, 4), dtype=np.uint8)
-    empty_bytes = bytes(height * width * 4)
-    img_info = skia.ImageInfo.Make(
-        width, height, skia.ColorType.kBGRA_8888_ColorType, skia.AlphaType.kPremul_AlphaType
-    )
-    surface = skia.Surface.MakeRasterDirect(img_info, frame_buf)
-    canvas = surface.getCanvas()
-    blit_paint = skia.Paint()
-    blit_sampling = skia.SamplingOptions()
-
-    write_q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=4)
-    write_err: list[BaseException] = []
-
-    def pipe_writer() -> None:
-        assert proc.stdin is not None
-        try:
+        def drain_err() -> None:
+            if proc.stderr is None:
+                return
             while True:
-                chunk = write_q.get()
-                if chunk is None:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
                     break
-                proc.stdin.write(chunk)
-        except BaseException as exc:
-            write_err.append(exc)
+                if len(stderr_chunks) < 16:
+                    stderr_chunks.append(chunk)
+
+        prog_thread = threading.Thread(target=read_progress, daemon=True)
+        err_thread = threading.Thread(target=drain_err, daemon=True)
+        prog_thread.start()
+        err_thread.start()
+
+        # Prepare frame buffer backed by numpy + Skia surface, plus async pipe writer
+        frame_buf = np.zeros((height, width, 4), dtype=np.uint8)
+        empty_bytes = bytes(height * width * 4)
+        img_info = skia.ImageInfo.Make(
+            width, height, skia.ColorType.kBGRA_8888_ColorType, skia.AlphaType.kPremul_AlphaType
+        )
+        surface = skia.Surface.MakeRasterDirect(img_info, frame_buf)
+        canvas = surface.getCanvas()
+        blit_paint = skia.Paint()
+        blit_sampling = skia.SamplingOptions()
+
+        write_q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=4)
+        write_err: list[BaseException] = []
+
+        def pipe_writer() -> None:
+            assert proc.stdin is not None
+            try:
+                while True:
+                    chunk = write_q.get()
+                    if chunk is None:
+                        break
+                    proc.stdin.write(chunk)
+            except BaseException as exc:
+                write_err.append(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        writer_thread = threading.Thread(target=pipe_writer, daemon=True)
+        writer_thread.start()
+
+        next_idx = 0
+        active: list[ScheduledDanmaku] = []
+        n_sched = len(scheduled)
+        start_wall = time.monotonic()
+
+        try:
+            for frame_idx in range(total_frames):
+                if cancel_event and cancel_event.is_set():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError("ジョブがキャンセルされました")
+                if write_err:
+                    raise write_err[0]
+
+                t = frame_idx / fps
+
+                while next_idx < n_sched and scheduled[next_idx].t_start <= t:
+                    item_s = scheduled[next_idx]
+                    if item_s.t_end >= t:
+                        if item_s.sprite is None:
+                            item_s.sprite = engine.render_sprite(item_s)
+                        active.append(item_s)
+                    next_idx += 1
+
+                # Drop expired & free sprite memory
+                still_active: list[ScheduledDanmaku] = []
+                for s in active:
+                    if s.t_end >= t:
+                        still_active.append(s)
+                    else:
+                        s.sprite = None
+                active = still_active
+
+                if not active:
+                    write_q.put(empty_bytes)
+                else:
+                    canvas.clear(skia.ColorTRANSPARENT)
+                    for s in active:
+                        if s.sprite is None:
+                            continue
+                        if s.mode == "naka":
+                            x = width - s.velocity * (t - s.t_start)
+                        else:
+                            x = (width - s.sprite.width()) * 0.5 + s.pad_x
+                        canvas.drawImage(
+                            s.sprite,
+                            float(x) - s.pad_x,
+                            float(s.y) - s.pad_y,
+                            blit_sampling,
+                            blit_paint,
+                        )
+                    write_q.put(frame_buf.tobytes())
+
+                if progress_cb and (frame_idx % max(1, int(fps // 2)) == 0 or frame_idx == total_frames - 1):
+                    pct = min(0.99, (frame_idx + 1) / total_frames)
+                    elapsed = max(0.1, time.monotonic() - start_wall)
+                    eta = int((elapsed / pct) * (1.0 - pct)) if pct > 0.01 else None
+                    progress_cb(
+                        pct,
+                        latest_stats["fps"] or ((frame_idx + 1) / elapsed),
+                        latest_stats["speed"],
+                        eta,
+                    )
+
+            write_q.put(None)
+            writer_thread.join(timeout=30.0)
+            if write_err and not isinstance(write_err[0], BrokenPipeError):
+                raise write_err[0]
+        except BrokenPipeError:
+            pass
         finally:
             try:
-                proc.stdin.close()
+                write_q.put_nowait(None)
             except Exception:
                 pass
-
-    writer_thread = threading.Thread(target=pipe_writer, daemon=True)
-    writer_thread.start()
-
-    next_idx = 0
-    active: list[ScheduledDanmaku] = []
-    n_sched = len(scheduled)
-    start_wall = time.monotonic()
-
-    try:
-        for frame_idx in range(total_frames):
             if cancel_event and cancel_event.is_set():
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                raise RuntimeError("ジョブがキャンセルされました")
-            if write_err:
-                raise write_err[0]
+            writer_thread.join(timeout=2.0)
+            if proc_hook:
+                proc_hook(proc, False)
 
-            t = frame_idx / fps
+        ret = proc.wait()
+        prog_thread.join(timeout=2.0)
+        err_thread.join(timeout=1.0)
+        err_txt = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
+        return ret, err_txt
 
-            while next_idx < n_sched and scheduled[next_idx].t_start <= t:
-                item_s = scheduled[next_idx]
-                if item_s.t_end >= t:
-                    if item_s.sprite is None:
-                        item_s.sprite = engine.render_sprite(item_s)
-                    active.append(item_s)
-                next_idx += 1
-
-            # Drop expired & free sprite memory
-            still_active: list[ScheduledDanmaku] = []
-            for s in active:
-                if s.t_end >= t:
-                    still_active.append(s)
-                else:
-                    s.sprite = None
-            active = still_active
-
-            if not active:
-                write_q.put(empty_bytes)
-            else:
-                canvas.clear(skia.ColorTRANSPARENT)
-                for s in active:
-                    if s.sprite is None:
-                        continue
-                    if s.mode == "naka":
-                        x = width - s.velocity * (t - s.t_start)
-                    else:
-                        x = (width - s.sprite.width()) * 0.5 + s.pad_x
-                    canvas.drawImage(
-                        s.sprite,
-                        float(x) - s.pad_x,
-                        float(s.y) - s.pad_y,
-                        blit_sampling,
-                        blit_paint,
-                    )
-                write_q.put(frame_buf.tobytes())
-
-            if progress_cb and (frame_idx % max(1, int(fps // 2)) == 0 or frame_idx == total_frames - 1):
-                pct = min(0.99, (frame_idx + 1) / total_frames)
-                elapsed = max(0.1, time.monotonic() - start_wall)
-                eta = int((elapsed / pct) * (1.0 - pct)) if pct > 0.01 else None
-                progress_cb(
-                    pct,
-                    latest_stats["fps"] or ((frame_idx + 1) / elapsed),
-                    latest_stats["speed"],
-                    eta,
-                )
-
-        write_q.put(None)
-        writer_thread.join(timeout=30.0)
-        if write_err and not isinstance(write_err[0], BrokenPipeError):
-            raise write_err[0]
+    try:
+        ret, err = _run_pass(hw_dec_args)
     except BrokenPipeError:
-        pass
-    finally:
-        try:
-            write_q.put_nowait(None)
-        except Exception:
-            pass
-        if cancel_event and cancel_event.is_set():
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        writer_thread.join(timeout=2.0)
-        if proc_hook:
-            proc_hook(proc, False)
+        if hw_dec_args and not (cancel_event and cancel_event.is_set()):
+            ret, err = _run_pass([])
+        else:
+            raise
+    if ret != 0 and hw_dec_args and not (cancel_event and cancel_event.is_set()):
+        # Fallback to software decode when GPU decode fails on exotic streams
+        ret, err = _run_pass([])
 
-    ret = proc.wait()
-    prog_thread.join(timeout=2.0)
-    err_thread.join(timeout=1.0)
     if cancel_event and cancel_event.is_set():
         raise RuntimeError("ジョブがキャンセルされました")
     if ret != 0:
-        err = b"".join(stderr_chunks).decode("utf-8", errors="ignore")
         raise RuntimeError(f"FFmpeg合成エラー (code {ret}): {err[-500:]}")

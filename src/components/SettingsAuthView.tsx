@@ -399,6 +399,37 @@ export function SettingsAuthView({
         <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4" style={{ borderColor: 'var(--md-outline-variant)' }}>
           <div>
             <div className="text-[13px]" style={{ color: 'var(--md-on-surface-variant)' }}>
+              同時実行ジョブ数
+            </div>
+            <div className="text-[12px]" style={{ color: 'var(--md-on-surface-muted)' }}>
+              複数ジョブを並列処理します（GPUメモリ節約時は 1 推奨）
+            </div>
+          </div>
+          <div className="flex gap-1 rounded-lg p-1" style={{ backgroundColor: 'var(--md-surface)' }}>
+            {[1, 2, 3].map((n) => (
+              <button
+                key={n}
+                type="button"
+                onClick={() => onUpdateSettings({ ...settings, max_concurrent_jobs: n })}
+                className="font-mono-tabular rounded-md px-3 py-1 text-[12px] font-medium"
+                style={{
+                  backgroundColor:
+                    (settings.max_concurrent_jobs || 1) === n ? 'var(--md-surface-highest)' : 'transparent',
+                  color:
+                    (settings.max_concurrent_jobs || 1) === n
+                      ? 'var(--md-on-surface)'
+                      : 'var(--md-on-surface-muted)',
+                }}
+              >
+                {n}件
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4" style={{ borderColor: 'var(--md-outline-variant)' }}>
+          <div>
+            <div className="text-[13px]" style={{ color: 'var(--md-on-surface-variant)' }}>
               スタンプ画像キャッシュ
             </div>
             <div className="text-[12px]" style={{ color: 'var(--md-on-surface-muted)' }}>
@@ -565,7 +596,7 @@ export function SettingsAuthView({
               NicoTube Studio 本体
             </div>
             <div className="font-mono-tabular mt-1 text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
-              v{appUpdateState?.version || '0.1.0'}
+              v{appUpdateState?.version || '0.2.2'}
             </div>
             <div
               className="mt-0.5 truncate text-[11px]"

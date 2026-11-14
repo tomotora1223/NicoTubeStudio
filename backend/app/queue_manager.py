@@ -32,6 +32,8 @@ class QueueManager:
         self._listeners: set[Callable[[dict[str, Any]], Coroutine[Any, Any, None]]] = set()
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
+        self._running_tasks: set[asyncio.Task] = set()
+        self._slot_event: Optional[asyncio.Event] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _make_proc_hook(self, jid: str) -> Callable[[subprocess.Popen, bool], None]:
@@ -52,8 +54,15 @@ class QueueManager:
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+        if self._slot_event is None:
+            self._slot_event = asyncio.Event()
+            self._slot_event.set()
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = loop.create_task(self._worker_loop())
+
+    def notify_concurrency_changed(self) -> None:
+        if self._slot_event is not None:
+            self._slot_event.set()
 
     def add_listener(self, cb: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         self._listeners.add(cb)
@@ -160,28 +169,43 @@ class QueueManager:
         self.order = [x for x in self.order if x in self.jobs]
         await self.broadcast("queue_snapshot", [j.model_dump() for j in self.list_jobs()])
 
+    async def _execute_job_task(self, jid: str, job: QueueJob) -> None:
+        try:
+            await self._run_job(job)
+        except Exception as exc:
+            if self._cancel_flags.get(jid) and self._cancel_flags[jid].is_set():
+                job.status = JobStatus.CANCELLED
+                job.stage_label = "キャンセル済み"
+                if not load_settings().keep_temp_files:
+                    shutil.rmtree(TEMP_DIR / jid, ignore_errors=True)
+            else:
+                job.status = JobStatus.FAILED
+                job.stage_label = "エラー"
+                job.error = str(exc)
+            await self.broadcast("job_updated", job.model_dump())
+        finally:
+            self._queue.task_done()
+            if self._slot_event is not None:
+                self._slot_event.set()
+
     async def _worker_loop(self) -> None:
         while True:
+            max_jobs = max(1, min(4, int(load_settings().max_concurrent_jobs or 1)))
+            while len(self._running_tasks) >= max_jobs:
+                if self._slot_event is not None:
+                    self._slot_event.clear()
+                    await self._slot_event.wait()
+                max_jobs = max(1, min(4, int(load_settings().max_concurrent_jobs or 1)))
+
             jid = await self._queue.get()
             job = self.jobs.get(jid)
             if not job or job.status == JobStatus.CANCELLED:
                 self._queue.task_done()
                 continue
-            try:
-                await self._run_job(job)
-            except Exception as exc:
-                if self._cancel_flags.get(jid) and self._cancel_flags[jid].is_set():
-                    job.status = JobStatus.CANCELLED
-                    job.stage_label = "キャンセル済み"
-                    if not load_settings().keep_temp_files:
-                        shutil.rmtree(TEMP_DIR / jid, ignore_errors=True)
-                else:
-                    job.status = JobStatus.FAILED
-                    job.stage_label = "エラー"
-                    job.error = str(exc)
-                await self.broadcast("job_updated", job.model_dump())
-            finally:
-                self._queue.task_done()
+
+            task = asyncio.create_task(self._execute_job_task(jid, job))
+            self._running_tasks.add(task)
+            task.add_done_callback(self._running_tasks.discard)
 
     def _unique_output_path(self, base_dir: Path, stem: str, ext: str) -> Path:
         cand = base_dir / f"{stem}.{ext}"
@@ -265,13 +289,6 @@ class QueueManager:
 
         ext = req.encode.container
         outputs: list[str] = []
-        if thumb_task:
-            try:
-                thumb_path = await thumb_task
-                if thumb_path and thumb_path.exists():
-                    outputs.append(str(thumb_path))
-            except Exception:
-                pass
 
         # 2. Produce clean (video_only) output if requested
         if req.encode.output_mode in (OutputMode.VIDEO_ONLY, OutputMode.BOTH):
@@ -313,8 +330,22 @@ class QueueManager:
         if need_chat:
             if not chat_path or not chat_path.exists():
                 if req.encode.output_mode == OutputMode.WITH_COMMENTS:
-                    # Fallback to clean video with notice
                     fallback_out = self._unique_output_path(out_dir, f"{base_name}_nochat", ext)
+                    job.status = JobStatus.RENDERING
+                    job.stage_label = "チャットなし動画を出力中..."
+                    job.progress = 0.50
+                    await self.broadcast("job_updated", job.model_dump())
+
+                    def fallback_prog(pct: float, fps: float, speed: str, eta: Optional[int]) -> None:
+                        if cancel_ev.is_set():
+                            return
+                        job.progress = 0.50 + pct * 0.49
+                        job.fps = round(fps, 1)
+                        job.speed = speed
+                        job.eta_sec = eta
+                        job.stage_label = f"チャットなし動画を出力中 ({pct*100:.1f}%)"
+                        self._emit_sync("job_updated", job.model_dump())
+
                     await asyncio.to_thread(
                         transcode_video_only,
                         str(source_video),
@@ -323,12 +354,12 @@ class QueueManager:
                         probe,
                         clip_offset_sec,
                         clip_duration_sec,
-                        None,
+                        fallback_prog,
                         cancel_ev,
                         proc_hook,
                     )
                     outputs.append(str(fallback_out))
-                    job.stage_label = "完了 (チャット情報なしのため動画のみ出力)"
+                job.stage_label = "完了 (チャット情報なしのため動画のみ出力)"
             else:
                 job.status = JobStatus.PARSING_CHAT
                 job.stage_label = "チャットデータを解析中..."
@@ -389,6 +420,14 @@ class QueueManager:
                     proc_hook,
                 )
                 outputs.append(str(danmaku_out))
+
+        if thumb_task:
+            try:
+                thumb_path = await thumb_task
+                if thumb_path and thumb_path.exists():
+                    outputs.append(str(thumb_path))
+            except Exception:
+                pass
 
         if not settings.keep_temp_files:
             shutil.rmtree(work_dir, ignore_errors=True)
