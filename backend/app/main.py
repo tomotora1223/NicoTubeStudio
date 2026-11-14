@@ -5,18 +5,19 @@ import base64
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import (
@@ -53,7 +54,12 @@ from .models import (
 )
 from .queue_manager import QueueManager
 from .tool_updater import tool_updater
-from .ytdlp_service import probe_video_info
+from .ytdlp_service import (
+    get_preview_entry,
+    get_preview_segment_url,
+    probe_video_info,
+    register_preview_segment,
+)
 
 queue_manager = QueueManager()
 
@@ -520,6 +526,223 @@ async def probe_url(payload: VideoProbeRequest) -> VideoInfoResponse:
         return await asyncio.to_thread(probe_video_info, url)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"解析エラー: {exc}") from exc
+
+
+def _build_preview_upstream_headers(entry: dict[str, Any], range_hdr: str | None = None) -> dict[str, str]:
+    hdrs: dict[str, str] = {}
+    raw_hdrs = entry.get("headers") or {}
+    if isinstance(raw_hdrs, dict):
+        for k, v in raw_hdrs.items():
+            kl = str(k).lower()
+            if kl in ("host", "content-length", "connection", "accept-encoding", "range"):
+                continue
+            hdrs[str(k)] = str(v)
+    hdrs.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    )
+    cookie_hdr = str(entry.get("cookie") or "").strip()
+    if cookie_hdr and "cookie" not in {k.lower() for k in hdrs}:
+        hdrs["Cookie"] = cookie_hdr
+    if range_hdr:
+        hdrs["Range"] = range_hdr
+    return hdrs
+
+
+async def _proxy_stream_url(
+    target_url: str,
+    entry: dict[str, Any],
+    range_hdr: str | None = None,
+    default_media_type: str = "video/mp4",
+) -> StreamingResponse:
+    hdrs = _build_preview_upstream_headers(entry, range_hdr=range_hdr)
+    client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(20.0, read=60.0))
+    try:
+        req = client.build_request("GET", target_url, headers=hdrs)
+        resp = await client.send(req, stream=True)
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Preview upstream error: {exc}") from exc
+
+    if resp.status_code >= 400:
+        code = resp.status_code
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=code, detail=f"Upstream HTTP {code}")
+
+    out_headers: dict[str, str] = {
+        "Accept-Ranges": resp.headers.get("accept-ranges") or "bytes",
+        "Cache-Control": "no-store",
+    }
+    for h_name in ("content-range", "content-length"):
+        val = resp.headers.get(h_name)
+        if val:
+            out_headers[h_name.title()] = val
+
+    media_type = resp.headers.get("content-type") or default_media_type
+
+    async def _iter_chunks():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _iter_chunks(),
+        status_code=resp.status_code,
+        media_type=media_type,
+        headers=out_headers,
+    )
+
+
+def _rewrite_m3u8_playlist(token: str, base_url: str, body: str) -> str:
+    out_lines: list[str] = []
+    prev_was_stream_inf = False
+
+    def _to_proxy_uri(raw_uri: str, force_manifest: bool = False) -> str:
+        abs_u = urljoin(base_url, raw_uri)
+        sid = register_preview_segment(token, abs_u)
+        if not sid:
+            return abs_u
+        path_part = abs_u.split("?", 1)[0].lower()
+        is_manifest = force_manifest or path_part.endswith(".m3u8")
+        kind = "manifest" if is_manifest else "seg"
+        return f"/api/preview/hls/{token}/{kind}/{sid}"
+
+    for line in body.splitlines():
+        s = line.strip()
+        if not s:
+            out_lines.append(line)
+            continue
+        if s.startswith("#"):
+            is_media_tag = s.startswith("#EXT-X-MEDIA:")
+            if 'URI="' in line:
+                line = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda m: f'URI="{_to_proxy_uri(m.group(1), force_manifest=is_media_tag)}"',
+                    line,
+                )
+            prev_was_stream_inf = s.startswith("#EXT-X-STREAM-INF")
+            out_lines.append(line)
+            continue
+        out_lines.append(_to_proxy_uri(s, force_manifest=prev_was_stream_inf))
+        prev_was_stream_inf = False
+
+    return "\n".join(out_lines)
+
+
+async def _fetch_rewritten_m3u8(token: str, target_url: str, entry: dict[str, Any]) -> Response:
+    hdrs = _build_preview_upstream_headers(entry)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        resp = await client.get(target_url, headers=hdrs)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=f"HLS upstream HTTP {resp.status_code}")
+        rewritten = _rewrite_m3u8_playlist(token, str(resp.url), resp.text)
+    return Response(
+        content=rewritten,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/preview/stream/{token}")
+async def preview_direct_stream(token: str, request: Request) -> StreamingResponse:
+    entry = get_preview_entry(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Preview session expired")
+    return await _proxy_stream_url(
+        str(entry["url"]),
+        entry,
+        range_hdr=request.headers.get("range"),
+        default_media_type="video/mp4",
+    )
+
+
+@app.get("/api/preview/hls/{token}/index.m3u8")
+async def preview_hls_index(token: str) -> Response:
+    entry = get_preview_entry(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Preview session expired")
+    return await _fetch_rewritten_m3u8(token, str(entry["url"]), entry)
+
+
+@app.get("/api/preview/hls/{token}/manifest/{seg_id}")
+async def preview_hls_child_manifest(token: str, seg_id: str) -> Response:
+    entry = get_preview_entry(token)
+    seg_url = get_preview_segment_url(token, seg_id)
+    if not entry or not seg_url:
+        raise HTTPException(status_code=404, detail="Preview HLS manifest not found")
+    return await _fetch_rewritten_m3u8(token, seg_url, entry)
+
+
+@app.get("/api/preview/hls/{token}/seg/{seg_id}")
+async def preview_hls_segment(token: str, seg_id: str, request: Request) -> StreamingResponse:
+    entry = get_preview_entry(token)
+    seg_url = get_preview_segment_url(token, seg_id)
+    if not entry or not seg_url:
+        raise HTTPException(status_code=404, detail="Preview segment not found")
+    return await _proxy_stream_url(
+        seg_url,
+        entry,
+        range_hdr=request.headers.get("range"),
+        default_media_type="video/mp2t",
+    )
+
+
+@app.get("/api/preview/frame")
+async def preview_single_frame(token: str, t: float = 0.0) -> Response:
+    entry = get_preview_entry(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Preview session expired")
+    ff = ensure_ffmpeg_in_path()
+    if not ff:
+        raise HTTPException(status_code=503, detail="FFmpeg not ready")
+    hdrs = _build_preview_upstream_headers(entry)
+    hdr_block = "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+    seek_t = max(0.0, float(t))
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "3",
+        "-ss",
+        f"{seek_t:.3f}",
+        "-headers",
+        hdr_block,
+        "-i",
+        str(entry["url"]),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=640:-2",
+        "-q:v",
+        "4",
+        "-f",
+        "image2",
+        "pipe:1",
+    ]
+
+    def _run_grab() -> bytes:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        res = subprocess.run(cmd, capture_output=True, timeout=14, creationflags=flags)
+        if res.returncode != 0 or not res.stdout:
+            err = res.stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(err or "Frame extraction failed")
+        return res.stdout
+
+    try:
+        jpg = await asyncio.to_thread(_run_grab)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Frame extraction failed: {exc}") from exc
+    return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=120"})
 
 
 @app.get("/api/auth/status", response_model=AuthStatus)

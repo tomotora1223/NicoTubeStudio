@@ -18,7 +18,7 @@ export function NavRail({
   activeJobCount,
   authStatus,
   encoders,
-  appVersion = '0.2.3',
+  appVersion = '0.2.4',
 }: NavRailProps) {
   const items: Array<{ id: NavTab; label: string; icon: typeof Download; badge?: number }> = [
     { id: 'capture', label: '取り込み・切り抜き', icon: Download },

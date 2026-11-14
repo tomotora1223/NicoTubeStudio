@@ -183,6 +183,7 @@ class VideoInfoResponse(BaseModel):
     has_live_chat: bool = False
     thumbnail: Optional[str] = None
     preview_stream_url: Optional[str] = None
+    preview_token: Optional[str] = None
     webpage_url: str
     resolutions: list[int] = Field(default_factory=list)
     fps_options: list[int] = Field(default_factory=list)

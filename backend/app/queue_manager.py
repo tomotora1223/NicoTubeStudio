@@ -106,6 +106,8 @@ class QueueManager:
         return job
 
     async def cancel_job(self, jid: str) -> Optional[QueueJob]:
+        import sys
+
         job = self.jobs.get(jid)
         if not job:
             return None
@@ -114,11 +116,27 @@ class QueueManager:
             ev.set()
         with self._proc_lock:
             procs = list(self._active_procs.get(jid) or ())
-        for proc in procs:
+
+        def _kill_proc_tree(proc: subprocess.Popen) -> None:
+            pid = getattr(proc, "pid", None)
+            if pid and sys.platform == "win32":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/pid", str(pid), "/f", "/t"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
             try:
                 proc.kill()
             except Exception:
                 pass
+
+        for proc in procs:
+            asyncio.create_task(asyncio.to_thread(_kill_proc_tree, proc))
         if job.status == JobStatus.QUEUED:
             job.status = JobStatus.CANCELLED
             job.stage_label = "キャンセル済み"
@@ -178,6 +196,9 @@ class QueueManager:
                 job.stage_label = "キャンセル済み"
                 if not load_settings().keep_temp_files:
                     shutil.rmtree(TEMP_DIR / jid, ignore_errors=True)
+                    if (TEMP_DIR / jid).exists():
+                        await asyncio.sleep(0.25)
+                        shutil.rmtree(TEMP_DIR / jid, ignore_errors=True)
             else:
                 job.status = JobStatus.FAILED
                 job.stage_label = "エラー"
@@ -372,6 +393,7 @@ class QueueManager:
                     req.clip_start_sec,
                     req.clip_end_sec,
                     req.comment_style.ng_words,
+                    check_cancel,
                 )
 
                 if req.comment_style.custom_emotes_enabled and items:
@@ -382,7 +404,7 @@ class QueueManager:
                         job.stage_label = label
                         self._emit_sync("job_updated", job.model_dump())
 
-                    await download_chat_emotes(items, emote_prog)
+                    await download_chat_emotes(items, emote_prog, cancel_check=check_cancel)
 
                 if check_cancel():
                     raise RuntimeError("Cancelled")

@@ -7,6 +7,7 @@ import {
   Cpu,
   ExternalLink,
   Film,
+  Image as ImageIcon,
   Loader2,
   Maximize2,
   MessageSquare,
@@ -14,6 +15,7 @@ import {
   Play,
   Plus,
   Repeat,
+  RotateCw,
   Scissors,
   Search,
   SlidersHorizontal,
@@ -62,6 +64,8 @@ export function CaptureWorkspace({
 }: CaptureWorkspaceProps) {
   const clipVideoRef = useRef<HTMLVideoElement | null>(null)
   const timelineTrackRef = useRef<HTMLDivElement | null>(null)
+  const seekThrottleRef = useRef<number>(0)
+  const cleaningUpVideoRef = useRef(false)
   const dragStateRef = useRef<{
     mode: 'start' | 'end' | 'window' | 'playhead'
     anchorX: number
@@ -84,6 +88,9 @@ export function CaptureWorkspace({
   const [previewPlaying, setPreviewPlaying] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  const [previewReloadKey, setPreviewReloadKey] = useState(0)
+  const [fallbackFrameUrl, setFallbackFrameUrl] = useState<string | null>(null)
+  const [fetchingFrame, setFetchingFrame] = useState(false)
   const [loopSegment, setLoopSegment] = useState(false)
   const [activeDragMode, setActiveDragMode] = useState<'start' | 'end' | 'window' | 'playhead' | null>(null)
 
@@ -103,6 +110,8 @@ export function CaptureWorkspace({
     if (!trimmed) return
     setProbing(true)
     setProbeError(null)
+    setPreviewError(null)
+    setFallbackFrameUrl(null)
     setQueuedNotice(null)
     try {
       const info = await api.probeUrl(trimmed)
@@ -145,11 +154,16 @@ export function CaptureWorkspace({
 
   const seekPreviewTo = (sec: number, autoPlay = false) => {
     const vid = clipVideoRef.current
-    if (!vid) return
-    const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : totalDur
+    const dur = vid && Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : totalDur
     const target = Math.max(0, Math.min(sec, dur))
-    vid.currentTime = target
     setPreviewCurrentSec(target)
+    if (previewError && videoInfo?.preview_token) {
+      requestFallbackFrame(target)
+    }
+    if (!vid) return
+    try {
+      vid.currentTime = target
+    } catch (_) {}
     if (autoPlay) {
       vid.play().catch(() => {})
     }
@@ -220,9 +234,16 @@ export function CaptureWorkspace({
   const clipSpan = Math.max(0, clipEnd - clipStart)
   const needsFfmpeg = !encoders?.ffmpeg_found
 
+  const requestFallbackFrame = (sec: number) => {
+    const token = videoInfo?.preview_token
+    if (!token) return
+    setFetchingFrame(true)
+    setFallbackFrameUrl(`${api.getPreviewFrameUrl(token, sec)}&_r=${Date.now()}`)
+  }
+
   useEffect(() => {
     const vid = clipVideoRef.current
-    const srcUrl = videoInfo?.preview_stream_url
+    const srcUrl = videoInfo ? api.getPreviewMediaUrl(videoInfo) : null
     if (!clipEnabled || !showRangePreview || !vid || !srcUrl) {
       setPreviewPlaying(false)
       setPreviewLoading(false)
@@ -230,21 +251,44 @@ export function CaptureWorkspace({
       return
     }
 
+    cleaningUpVideoRef.current = false
     setPreviewLoading(true)
     setPreviewError(null)
 
     let hls: Hls | null = null
-    if (srcUrl.includes('.m3u8') && Hls.isSupported()) {
-      hls = new Hls({ enableWorker: true, lowLatencyMode: false })
+    let networkRetries = 0
+    let mediaRetries = 0
+    const isHls = Boolean(srcUrl.includes('.m3u8') || videoInfo?.preview_stream_url?.includes('.m3u8'))
+
+    if (isHls && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        manifestLoadingMaxRetry: 3,
+        levelLoadingMaxRetry: 3,
+        fragLoadingMaxRetry: 3,
+      })
       hls.loadSource(srcUrl)
       hls.attachMedia(vid)
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         setPreviewLoading(false)
+        setPreviewError(null)
       })
       hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (data.fatal) {
+        if (data.fatal && hls) {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+            networkRetries += 1
+            hls.startLoad()
+            return
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
+            mediaRetries += 1
+            hls.recoverMediaError()
+            return
+          }
           setPreviewLoading(false)
-          setPreviewError('プレビュー映像の読み込みに失敗しました（時刻指定での切り抜きは利用できます）')
+          setPreviewError('プレビュー映像を読み込めませんでした（下の時刻指定・静止画で確認可能）')
+          requestFallbackFrame(previewCurrentSec)
         }
       })
     } else {
@@ -252,6 +296,7 @@ export function CaptureWorkspace({
     }
 
     return () => {
+      cleaningUpVideoRef.current = true
       if (hls) {
         hls.destroy()
       }
@@ -259,7 +304,7 @@ export function CaptureWorkspace({
       vid.removeAttribute('src')
       vid.load()
     }
-  }, [videoInfo?.preview_stream_url, showRangePreview, clipEnabled])
+  }, [videoInfo?.preview_token, videoInfo?.preview_stream_url, showRangePreview, clipEnabled, previewReloadKey])
 
   const secFromClientX = (clientX: number): number => {
     const el = timelineTrackRef.current
@@ -267,6 +312,15 @@ export function CaptureWorkspace({
     const rect = el.getBoundingClientRect()
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)))
     return Math.round(ratio * totalDur)
+  }
+
+  const seekThrottled = (sec: number) => {
+    setPreviewCurrentSec(sec)
+    const now = Date.now()
+    if (now - seekThrottleRef.current >= 150) {
+      seekThrottleRef.current = now
+      seekPreviewTo(sec)
+    }
   }
 
   const handleTimelinePointerDown = (
@@ -296,27 +350,40 @@ export function CaptureWorkspace({
     if (ds.mode === 'start') {
       const next = Math.min(secFromClientX(e.clientX), Math.max(0, clipEnd - 1))
       setClipStart(next)
-      seekPreviewTo(next)
+      seekThrottled(next)
     } else if (ds.mode === 'end') {
       const next = Math.max(secFromClientX(e.clientX), Math.min(totalDur, clipStart + 1))
       setClipEnd(next)
-      seekPreviewTo(next)
+      seekThrottled(next)
     } else if (ds.mode === 'window') {
       const deltaSec = Math.round(((e.clientX - ds.anchorX) / pxW) * totalDur)
       const span = Math.max(1, ds.initEnd - ds.initStart)
       const nextStart = Math.max(0, Math.min(totalDur - span, ds.initStart + deltaSec))
       setClipStart(nextStart)
       setClipEnd(nextStart + span)
-      seekPreviewTo(nextStart)
+      seekThrottled(nextStart)
     } else {
-      seekPreviewTo(secFromClientX(e.clientX))
+      seekThrottled(secFromClientX(e.clientX))
     }
   }
 
   const handleTimelinePointerUp = (e: React.PointerEvent<HTMLElement>) => {
-    if (!dragStateRef.current) return
+    const ds = dragStateRef.current
+    if (!ds) return
     dragStateRef.current = null
     setActiveDragMode(null)
+    if (ds.mode === 'start') {
+      seekPreviewTo(clipStart)
+    } else if (ds.mode === 'end') {
+      seekPreviewTo(clipEnd)
+    } else if (ds.mode === 'window') {
+      seekPreviewTo(clipStart)
+    } else {
+      seekPreviewTo(secFromClientX(e.clientX))
+    }
+    if (previewError && videoInfo?.preview_token) {
+      requestFallbackFrame(ds.mode === 'end' ? clipEnd : clipStart)
+    }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId)
     }
@@ -646,11 +713,38 @@ export function CaptureWorkspace({
                             ref={clipVideoRef}
                             controls
                             preload="metadata"
-                            onLoadedMetadata={() => setPreviewLoading(false)}
-                            onCanPlay={() => setPreviewLoading(false)}
-                            onError={() => {
+                            onLoadedMetadata={() => {
                               setPreviewLoading(false)
-                              setPreviewError('プレビュー映像を読み込めませんでした（下の時刻指定で切り抜き可能）')
+                              setPreviewError(null)
+                            }}
+                            onLoadedData={() => {
+                              setPreviewLoading(false)
+                              setPreviewError(null)
+                              setFallbackFrameUrl(null)
+                            }}
+                            onCanPlay={() => {
+                              setPreviewLoading(false)
+                              setPreviewError(null)
+                            }}
+                            onPlaying={() => {
+                              setPreviewLoading(false)
+                              setPreviewError(null)
+                              setFallbackFrameUrl(null)
+                            }}
+                            onSeeked={() => setPreviewError(null)}
+                            onError={(e) => {
+                              const vid = e.currentTarget
+                              if (
+                                cleaningUpVideoRef.current ||
+                                !vid.currentSrc ||
+                                vid.networkState === 0 ||
+                                vid.readyState >= 2
+                              ) {
+                                return
+                              }
+                              setPreviewLoading(false)
+                              setPreviewError('プレビュー映像を読み込めませんでした（時刻指定・静止画で確認可能）')
+                              requestFallbackFrame(previewCurrentSec)
                             }}
                             onPlay={() => setPreviewPlaying(true)}
                             onPause={() => setPreviewPlaying(false)}
@@ -664,6 +758,15 @@ export function CaptureWorkspace({
                             }}
                             className="h-full w-full object-contain"
                           />
+                          {fallbackFrameUrl && previewError && (
+                            <img
+                              src={fallbackFrameUrl}
+                              alt="静止画プレビュー"
+                              onLoad={() => setFetchingFrame(false)}
+                              onError={() => setFetchingFrame(false)}
+                              className="pointer-events-none absolute inset-0 h-full w-full object-contain bg-black"
+                            />
+                          )}
                           {previewLoading && !previewError && (
                             <div
                               className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2"
@@ -677,13 +780,44 @@ export function CaptureWorkspace({
                           )}
                           {previewError && (
                             <div
-                              className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-6 text-center"
-                              style={{ backgroundColor: 'rgba(15, 15, 16, 0.85)' }}
+                              className="pointer-events-auto absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2"
+                              style={{
+                                backgroundColor: 'rgba(15, 15, 16, 0.88)',
+                                border: '1px solid var(--md-outline-variant)',
+                              }}
                             >
-                              <AlertCircle size={18} strokeWidth={1.5} style={{ color: 'var(--md-warning)' }} />
-                              <span className="text-[12px]" style={{ color: '#ededed' }}>
-                                {previewError}
-                              </span>
+                              <div className="flex items-center gap-2">
+                                <AlertCircle size={15} strokeWidth={1.5} style={{ color: 'var(--md-warning)' }} />
+                                <span className="text-[11px]" style={{ color: '#ededed' }}>
+                                  {previewError}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                {videoInfo?.preview_token && (
+                                  <button
+                                    type="button"
+                                    onClick={() => requestFallbackFrame(previewCurrentSec)}
+                                    className="flex items-center gap-1 rounded px-2 py-1 text-[11px]"
+                                    style={{ backgroundColor: 'var(--md-surface-highest)', color: '#ededed' }}
+                                  >
+                                    <ImageIcon size={12} strokeWidth={1.5} />
+                                    {fetchingFrame ? '取得中...' : '現在時刻の静止画'}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPreviewError(null)
+                                    setFallbackFrameUrl(null)
+                                    setPreviewReloadKey((k) => k + 1)
+                                  }}
+                                  className="flex items-center gap-1 rounded px-2 py-1 text-[11px]"
+                                  style={{ backgroundColor: 'var(--md-primary)', color: '#111113' }}
+                                >
+                                  <RotateCw size={12} strokeWidth={1.5} />
+                                  再読込
+                                </button>
+                              </div>
                             </div>
                           )}
                           <div

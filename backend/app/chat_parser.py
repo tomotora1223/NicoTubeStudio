@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -161,6 +162,194 @@ def fetch_twitch_chat_to_file(
     if progress_cb:
         progress_cb(0.06, f"Twitchコメント取得完了 ({len(collected)}件)")
     return dest_path
+
+
+def _fmt_hhmmss(sec: float) -> str:
+    t = max(0, int(sec))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def fetch_youtube_chat_to_file(
+    url: str,
+    dest_path: Path,
+    cookie_path: Optional[str] = None,
+    clip_start_sec: Optional[float] = None,
+    clip_end_sec: Optional[float] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[Path]:
+    """Fast, cancellable YouTube live_chat_replay fetcher supporting range seek."""
+    from yt_dlp import YoutubeDL
+    from yt_dlp.extractor.youtube import YoutubeBaseInfoExtractor
+    from yt_dlp.networking import Request
+    from yt_dlp.utils import try_get
+
+    m_vid = re.search(r"(?:v=|youtu\.be/|youtube\.com/(?:live|shorts)/)([A-Za-z0-9_-]{11})", url)
+    if not m_vid:
+        return None
+    video_id = m_vid.group(1)
+
+    ydl_opts: dict = {"quiet": True, "no_warnings": True, "socket_timeout": 15}
+    if cookie_path:
+        ydl_opts["cookiefile"] = cookie_path
+
+    def check_cancelled() -> None:
+        if cancel_check and cancel_check():
+            raise RuntimeError("Cancelled by user")
+
+    def sleep_cancellable(sec: float) -> None:
+        end_t = time.monotonic() + sec
+        while time.monotonic() < end_t:
+            check_cancelled()
+            time.sleep(min(0.1, max(0.01, end_t - time.monotonic())))
+
+    start_ms = max(0, int((clip_start_sec or 0.0) * 1000))
+    end_ms = int(clip_end_sec * 1000) if clip_end_sec is not None else None
+    part_path = dest_path.with_name(dest_path.name + ".part")
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ie = YoutubeBaseInfoExtractor(ydl)
+            check_cancelled()
+            watch_url = f"https://www.youtube.com/watch?v={video_id}&bpctr=9999999999&has_verified=1"
+            html = ydl.urlopen(Request(watch_url)).read().decode("utf-8", "replace")
+            check_cancelled()
+            data = ie.extract_yt_initial_data(video_id, html)
+            ytcfg = ie.extract_ytcfg(video_id, html)
+            if not data or not ytcfg:
+                return None
+
+            cont = try_get(
+                data,
+                lambda x: x["contents"]["twoColumnWatchNextResults"]["conversationBar"][
+                    "liveChatRenderer"
+                ]["continuations"][0]["reloadContinuationData"]["continuation"],
+                str,
+            )
+            api_key = try_get(ytcfg, lambda x: x["INNERTUBE_API_KEY"], str)
+            ctx = try_get(ytcfg, lambda x: x["INNERTUBE_CONTEXT"], dict)
+            if not cont or not api_key or not ctx:
+                return None
+
+            visitor_data = try_get(ctx, lambda x: x["client"]["visitorData"], str)
+            check_cancelled()
+            replay_url = f"https://www.youtube.com/live_chat_replay?continuation={cont}"
+            html2 = ydl.urlopen(Request(replay_url)).read().decode("utf-8", "replace")
+            d2 = ie.extract_yt_initial_data(video_id, html2)
+            lcc2 = try_get(d2, lambda x: x["continuationContents"]["liveChatContinuation"], dict) or {}
+
+            # Only handle VOD liveChatReplayContinuationData here; fall back for live streams
+            has_replay_cont = any(
+                "liveChatReplayContinuationData" in c or "playerSeekContinuationData" in c
+                for c in (lcc2.get("continuations") or [])
+                if isinstance(c, dict)
+            )
+            if not has_replay_cont:
+                return None
+
+            unfilt = try_get(
+                lcc2,
+                lambda x: x["header"]["liveChatHeaderRenderer"]["viewSelector"][
+                    "sortFilterSubMenuRenderer"
+                ]["subMenuItems"][1]["continuation"]["reloadContinuationData"]["continuation"],
+                str,
+            )
+            if unfilt:
+                cont = unfilt
+
+            api_url = f"https://www.youtube.com/youtubei/v1/live_chat/get_live_chat_replay?key={api_key}"
+            hdrs = ie.generate_api_headers(ytcfg=ytcfg, visitor_data=visitor_data)
+            hdrs["content-type"] = "application/json"
+
+            cur_cont: Optional[str] = cont
+            cur_ctp: Optional[str] = None
+            cur_offset_ms = max(0, start_ms - 5000) if start_ms > 0 else 0
+            count = 0
+            max_seen_ms = 0
+            page = 0
+
+            with open(part_path, "wb") as out_f:
+                while cur_cont and page < 4000:
+                    check_cancelled()
+                    page += 1
+                    c_ctx = json.loads(json.dumps(ctx))
+                    if cur_ctp:
+                        c_ctx["clickTracking"] = {"clickTrackingParams": cur_ctp}
+                    req_obj = {
+                        "context": c_ctx,
+                        "continuation": cur_cont,
+                        "currentPlayerState": {"playerOffsetMs": str(max(0, cur_offset_ms))},
+                    }
+                    body_bytes = json.dumps(req_obj, ensure_ascii=False).encode("utf-8")
+
+                    resp_json = None
+                    for attempt in range(4):
+                        check_cancelled()
+                        try:
+                            raw = ydl.urlopen(Request(api_url, data=body_bytes, headers=hdrs)).read()
+                            resp_json = json.loads(raw.decode("utf-8", "replace"))
+                            break
+                        except Exception:
+                            if attempt == 3:
+                                raise
+                            sleep_cancellable(0.5 * (attempt + 1))
+
+                    if not resp_json:
+                        break
+                    lcc = try_get(resp_json, lambda x: x["continuationContents"]["liveChatContinuation"], dict)
+                    if not lcc:
+                        break
+
+                    actions = lcc.get("actions") or []
+                    page_offs: list[int] = []
+                    for act in actions:
+                        replay_act = act.get("replayChatItemAction") if isinstance(act, dict) else None
+                        if replay_act and replay_act.get("videoOffsetTimeMsec") is not None:
+                            try:
+                                off_ms = int(replay_act["videoOffsetTimeMsec"])
+                                page_offs.append(off_ms)
+                                if off_ms > max_seen_ms:
+                                    max_seen_ms = off_ms
+                            except Exception:
+                                pass
+                        out_f.write(json.dumps(act, ensure_ascii=False).encode("utf-8") + b"\n")
+                        count += 1
+
+                    if progress_cb and (page == 1 or page % 3 == 0):
+                        time_lbl = _fmt_hhmmss(max_seen_ms / 1000.0) if max_seen_ms > 0 else "00:00:00"
+                        progress_cb(0.05, f"コメント取得中 ({count}件 · {time_lbl})")
+
+                    if end_ms is not None and page_offs and max(page_offs) > end_ms + 10000:
+                        if min(page_offs) > end_ms + 10000 or page >= 2:
+                            break
+
+                    nxt = try_get(lcc, lambda x: x["continuations"][0]["liveChatReplayContinuationData"], dict)
+                    if not nxt or not nxt.get("continuation"):
+                        break
+                    cur_cont = nxt.get("continuation")
+                    cur_ctp = nxt.get("clickTrackingParams")
+                    if page_offs:
+                        cur_offset_ms = max(cur_offset_ms, max(page_offs))
+                    else:
+                        break
+
+        if count == 0:
+            part_path.unlink(missing_ok=True)
+            return None
+        part_path.replace(dest_path)
+        if progress_cb:
+            progress_cb(0.08, f"YouTubeコメント取得完了 ({count}件)")
+        return dest_path
+    except Exception as exc:
+        try:
+            part_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if "Cancelled" in str(exc):
+            raise
+        return None
 
 
 @dataclass
@@ -402,6 +591,7 @@ def parse_live_chat_json(
     clip_start_sec: Optional[float] = None,
     clip_end_sec: Optional[float] = None,
     ng_words: Optional[list[str]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[ParsedChatItem]:
     path = Path(json_path)
     if not path.exists():
@@ -424,7 +614,9 @@ def parse_live_chat_json(
             return []
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
+        for idx, line in enumerate(f):
+            if cancel_check and (idx % 1000 == 0) and cancel_check():
+                raise RuntimeError("Cancelled by user")
             line = line.strip()
             if not line:
                 continue
@@ -614,6 +806,7 @@ def parse_live_chat_json(
 async def download_chat_emotes(
     items: list[ParsedChatItem],
     progress_cb: Optional[Callable[[float, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Download unique custom emotes & stickers to EMOTE_CACHE_DIR and attach local paths."""
     EMOTE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -647,7 +840,11 @@ async def download_chat_emotes(
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             async def fetch_one(url: str, dest: Path) -> None:
                 nonlocal done
+                if cancel_check and cancel_check():
+                    return
                 async with sem:
+                    if cancel_check and cancel_check():
+                        return
                     try:
                         resp = await client.get(url)
                         if resp.status_code == 200 and resp.content:
@@ -657,7 +854,7 @@ async def download_chat_emotes(
                         pass
                     finally:
                         done += 1
-                        if progress_cb and (done % 10 == 0 or done == total):
+                        if progress_cb and (done % 10 == 0 or done == total) and not (cancel_check and cancel_check()):
                             progress_cb(done / total, f"スタンプ画像をキャッシュ中 ({done}/{total})")
 
             await asyncio.gather(*(fetch_one(u, d) for u, d in to_fetch))

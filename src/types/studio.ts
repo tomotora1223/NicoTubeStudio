@@ -177,6 +177,7 @@ export interface VideoInfoResponse {
   has_live_chat: boolean
   thumbnail?: string | null
   preview_stream_url?: string | null
+  preview_token?: string | null
   webpage_url: string
   resolutions: number[]
   fps_options: number[]

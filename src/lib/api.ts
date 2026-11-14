@@ -111,6 +111,21 @@ export const api = {
   retryJob: (id: string) => req<QueueJob>(`/api/queue/${id}/retry`, { method: 'POST' }),
   deleteJob: (id: string) => req<{ deleted: boolean }>(`/api/queue/${id}`, { method: 'DELETE' }),
   clearQueue: () => req<{ cleared: boolean }>('/api/queue/clear', { method: 'POST' }),
+  getPreviewMediaUrl: (info: VideoInfoResponse): string | null => {
+    const base = getApiBaseSync()
+    if (info.preview_token) {
+      if (info.preview_stream_url?.includes('.m3u8')) {
+        return `${base}/api/preview/hls/${encodeURIComponent(info.preview_token)}/index.m3u8`
+      }
+      return `${base}/api/preview/stream/${encodeURIComponent(info.preview_token)}`
+    }
+    return info.preview_stream_url || null
+  },
+  getPreviewFrameUrl: (token: string, sec: number): string => {
+    const base = getApiBaseSync()
+    const t = Math.max(0, Math.floor(sec))
+    return `${base}/api/preview/frame?token=${encodeURIComponent(token)}&t=${t}`
+  },
 }
 
 export async function loadDynamicFontFace(family: string): Promise<void> {
