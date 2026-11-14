@@ -319,7 +319,7 @@ export default function App() {
         activeJobCount={activeJobCount}
         authStatus={authStatus}
         encoders={encoders}
-        appVersion={appUpdateState?.version || '0.2.4'}
+        appVersion={appUpdateState?.version || '0.2.5'}
       />
 
       <main className="min-w-0 flex-1 overflow-y-auto">

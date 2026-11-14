@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import shutil
@@ -204,7 +205,8 @@ def probe_video_info(url: str) -> VideoInfoResponse:
 
         if vcodec == "none" or not height:
             continue
-        resolutions_set.add(int(height))
+        eff_res = min(int(width), int(height)) if (width and height) else int(height)
+        resolutions_set.add(eff_res)
         if fps:
             fps_set.add(int(round(float(fps))))
 
@@ -219,7 +221,7 @@ def probe_video_info(url: str) -> VideoInfoResponse:
                 + is_h264 * 600
                 + has_audio * 500
                 + is_mp4 * 150
-                - abs(int(height) - 480)
+                - abs(eff_res - 480)
             )
             hdrs = dict(f.get("http_headers") or fallback_headers or {})
             mime = "application/vnd.apple.mpegurl" if is_hls else f"video/{'webm' if ext == 'webm' else 'mp4'}"
@@ -294,10 +296,31 @@ def probe_video_info(url: str) -> VideoInfoResponse:
     )
 
 
-def _build_format_selector(resolution: str, max_fps: int, prefer_hls: bool = False) -> str:
+def _is_portrait_info(info: Optional[dict]) -> bool:
+    if not info:
+        return False
+    fmts = [
+        f
+        for f in (info.get("formats") or [])
+        if (f.get("vcodec") or "none") != "none" and f.get("width") and f.get("height")
+    ]
+    if fmts:
+        top = max(fmts, key=lambda f: int(f["height"]) * int(f["width"]))
+        return int(top["height"]) > int(top["width"])
+    w, h = info.get("width"), info.get("height")
+    return bool(w and h and int(h) > int(w))
+
+
+def _build_format_selector(
+    resolution: str,
+    max_fps: int,
+    prefer_hls: bool = False,
+    is_portrait: bool = False,
+) -> str:
     filters: list[str] = []
     if resolution != "best" and resolution.isdigit():
-        filters.append(f"height<={resolution}")
+        dim_key = "width" if is_portrait else "height"
+        filters.append(f"{dim_key}<={resolution}")
     if max_fps > 0:
         filters.append(f"fps<={max_fps}.5")
     cond = "".join(f"[{c}]" for c in filters)
@@ -321,7 +344,7 @@ def _build_ffmpeg_input_cmd_part(
     f_url = str(fmt["url"])
     part: list[str] = []
     if f_url.startswith(("http://", "https://")):
-        part += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"]
+        part += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4", "-rw_timeout", "20000000"]
     cookies = cookiejar.get_cookies_for_url(f_url) if cookiejar else []
     if cookies:
         cookie_hdr = "".join(
@@ -456,16 +479,20 @@ def _selected_formats_reachable(info: dict, cookiejar) -> bool:
     if not selected:
         return False
     fallback_hdrs = info.get("http_headers") or {}
-    for fmt in selected:
+
+    def _check_one(fmt: dict) -> bool:
         f_url = str(fmt.get("url") or "")
         proto = str(fmt.get("protocol") or "")
         if not f_url.startswith(("http://", "https://")):
             return False
-        is_hls = proto in ("m3u8_native", "m3u8") or ".m3u8" in f_url.lower()
+        is_hls = proto in ("m3u8_native", "m3u8") or ".m3u8" in f_url.split("?", 1)[0].lower()
         hdrs = fmt.get("http_headers") or fallback_hdrs
-        if not _probe_stream_url_ok(f_url, hdrs, cookiejar, is_hls=is_hls):
-            return False
-    return True
+        return _probe_stream_url_ok(f_url, hdrs, cookiejar, is_hls=is_hls)
+
+    if len(selected) == 1:
+        return _check_one(selected[0])
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        return all(pool.map(_check_one, selected))
 
 
 def _resolve_working_extraction(
@@ -474,45 +501,69 @@ def _resolve_working_extraction(
     cookie_path: Optional[str],
     twitch_mode: bool,
     cancel_check: Optional[Callable[[], bool]] = None,
+    prefer_hls_first: bool = False,
 ) -> tuple[dict, dict, object]:
-    """Try format/protocol/cookie strategies until selected stream URLs actually return HTTP 2xx."""
+    """Extract once per (cookie, client) and select reachable formats in-memory."""
     import yt_dlp
 
-    attempts: list[tuple[Optional[str], bool, Optional[list[str]]]] = [
-        (cookie_path, False, None),
-        (cookie_path, True, None),
-    ]
+    groups: list[tuple[Optional[str], Optional[list[str]]]] = [(cookie_path, None)]
     if cookie_path:
-        attempts.extend([
-            (None, False, None),
-            (None, True, None),
-        ])
+        groups.append((None, None))
     if not twitch_mode:
-        attempts.append((None, True, ["android_vr", "tv", "web"]))
+        groups.append((None, ["android_vr", "tv", "web"]))
 
+    hls_order = (True, False) if prefer_hls_first else (False, True)
     last_info: Optional[dict] = None
     last_opts: Optional[dict] = None
     last_cj: object = None
     last_err: Optional[Exception] = None
 
-    for ck, prefer_hls, clients in attempts:
+    for ck, clients in groups:
         if cancel_check and cancel_check():
             raise RuntimeError("Cancelled by user")
-        opts = _common_ytdlp_opts(ck)
-        opts["skip_download"] = True
-        opts["format"] = _build_format_selector(encode.resolution, encode.max_fps, prefer_hls=prefer_hls)
+        base_opts = _common_ytdlp_opts(ck)
+        base_opts["skip_download"] = True
         if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            base_opts["extractor_args"] = {"youtube": {"player_client": clients}}
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False) or {}
+            with yt_dlp.YoutubeDL(base_opts) as ydl:
+                raw_info = ydl.extract_info(url, download=False, process=False) or {}
                 cj = ydl.cookiejar
-            if not info:
-                continue
-            last_info, last_opts, last_cj = info, opts, cj
-            if _selected_formats_reachable(info, cj):
-                return opts, info, cj
+                if not raw_info:
+                    continue
+
+                is_portrait = _is_portrait_info(raw_info)
+                if raw_info.get("formats"):
+                    for prefer_hls in hls_order:
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("Cancelled by user")
+                        sel_str = _build_format_selector(
+                            encode.resolution, encode.max_fps, prefer_hls=prefer_hls, is_portrait=is_portrait
+                        )
+                        opts = dict(base_opts)
+                        opts["format"] = sel_str
+                        ydl.format_selector = ydl.build_format_selector(sel_str)
+                        info = ydl.process_ie_result(copy.deepcopy(raw_info), download=False) or {}
+                        if not info:
+                            continue
+                        last_info, last_opts, last_cj = info, opts, cj
+                        if _selected_formats_reachable(info, cj):
+                            return opts, info, cj
+                else:
+                    sel_str = _build_format_selector(
+                        encode.resolution, encode.max_fps, prefer_hls=False, is_portrait=is_portrait
+                    )
+                    opts = dict(base_opts)
+                    opts["format"] = sel_str
+                    ydl.format_selector = ydl.build_format_selector(sel_str)
+                    info = ydl.process_ie_result(copy.deepcopy(raw_info), download=False) or {}
+                    if info:
+                        last_info, last_opts, last_cj = info, opts, cj
+                        if _selected_formats_reachable(info, cj):
+                            return opts, info, cj
         except Exception as exc:
+            if (cancel_check and cancel_check()) or "Cancelled" in str(exc):
+                raise RuntimeError("Cancelled by user") from exc
             last_err = exc
             continue
 
@@ -521,6 +572,254 @@ def _resolve_working_extraction(
     if last_err is not None:
         raise last_err
     raise RuntimeError("ストリーム情報の取得に失敗しました")
+
+
+def _parallel_hls_clip_download(
+    ffmpeg_exe: str,
+    info: dict,
+    selected: list[dict],
+    cookiejar,
+    work_dir: Path,
+    s: float,
+    e: float,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    proc_hook: Optional[Callable[[subprocess.Popen, bool], None]] = None,
+) -> Optional[tuple[Path, float, Optional[float]]]:
+    """Lightweight 6-connection keep-alive HLS segment clip download + local concat."""
+    if not selected or len(selected) > 2 or e == float("inf") or e <= s:
+        return None
+    for fmt in selected:
+        f_url = str(fmt.get("url") or "")
+        proto = str(fmt.get("protocol") or "")
+        is_hls = proto in ("m3u8_native", "m3u8") or ".m3u8" in f_url.split("?", 1)[0].lower()
+        if not (is_hls and f_url.startswith(("http://", "https://"))):
+            return None
+
+    fallback_headers = dict(info.get("http_headers") or {})
+    target_dur = e - s
+    pad_start = max(0.0, s - 2.0)
+    pad_end = e + 2.0
+    stream_plans: list[tuple[int, dict, list[tuple[int, float, float, str]]]] = []
+    seg_dirs: list[Path] = []
+    concat_files: list[Path] = []
+
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(18.0, connect=6.0),
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=8),
+        ) as client:
+            for idx, fmt in enumerate(selected):
+                if cancel_check and cancel_check():
+                    raise RuntimeError("Cancelled by user")
+                f_url = str(fmt["url"])
+                hdrs = {str(k): str(v) for k, v in {**fallback_headers, **(fmt.get("http_headers") or {})}.items()}
+                ck = _build_cookie_header(cookiejar, f_url)
+                if ck and "cookie" not in {k.lower() for k in hdrs}:
+                    hdrs["Cookie"] = ck
+                resp = client.get(f_url, headers=hdrs)
+                if resp.status_code >= 400:
+                    return None
+                m3u8_txt = resp.text
+                if any(
+                    tag in m3u8_txt
+                    for tag in (
+                        "#EXT-X-STREAM-INF",
+                        "#EXT-X-KEY",
+                        "#EXT-X-MAP",
+                        "#EXT-X-BYTERANGE",
+                        "#EXT-X-DISCONTINUITY",
+                    )
+                ) or "#EXT-X-ENDLIST" not in m3u8_txt:
+                    return None
+
+                base_u = str(resp.url)
+                cur_t = 0.0
+                dur_next = 0.0
+                segs: list[tuple[int, float, float, str]] = []
+                for ln in m3u8_txt.splitlines():
+                    ls = ln.strip()
+                    if not ls:
+                        continue
+                    if ls.startswith("#EXTINF:"):
+                        try:
+                            dur_next = float(ls.split(":", 1)[1].split(",", 1)[0])
+                        except Exception:
+                            dur_next = 0.0
+                    elif not ls.startswith("#"):
+                        if dur_next <= 0:
+                            return None
+                        if cur_t + dur_next > pad_start and cur_t < pad_end:
+                            segs.append((len(segs), cur_t, dur_next, urljoin(base_u, ls)))
+                        cur_t += dur_next
+                        dur_next = 0.0
+
+                if len(segs) < 2:
+                    return None
+                stream_plans.append((idx, hdrs, segs))
+
+            if len(stream_plans) != len(selected):
+                return None
+
+            base_start = min(sg[0][1] for _, _, sg in stream_plans)
+            total_segs = sum(len(sg) for _, _, sg in stream_plans)
+            done_segs = [0]
+            done_bytes = [0]
+            stat_lock = threading.Lock()
+            last_emit = [0.0]
+
+            if progress_cb:
+                progress_cb(0.05, "切り抜き区間へ高速並列接続中...")
+
+            dl_jobs: list[tuple[dict, Path, str]] = []
+            for idx, hdrs, sg in stream_plans:
+                sdir = work_dir / f"_hls_seg_{idx}"
+                sdir.mkdir(parents=True, exist_ok=True)
+                seg_dirs.append(sdir)
+                for seg_i, _, _, seg_u in sg:
+                    dl_jobs.append((hdrs, sdir / f"{seg_i:05d}.ts", seg_u))
+
+            tls = threading.local()
+            thread_clients: list[httpx.Client] = []
+            client_reg_lock = threading.Lock()
+
+            def _get_worker_client() -> httpx.Client:
+                c = getattr(tls, "client", None)
+                if c is None:
+                    c = httpx.Client(
+                        timeout=httpx.Timeout(18.0, connect=6.0),
+                        follow_redirects=True,
+                        limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+                    )
+                    tls.client = c
+                    with client_reg_lock:
+                        thread_clients.append(c)
+                return c
+
+            def fetch_seg(job_item: tuple[dict, Path, str]) -> None:
+                hdrs, dest, seg_u = job_item
+                last_e: Optional[Exception] = None
+                wclient = _get_worker_client()
+                for attempt in range(3):
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("Cancelled by user")
+                    try:
+                        r = wclient.get(seg_u, headers=hdrs)
+                        r.raise_for_status()
+                        dest.write_bytes(r.content)
+                        sz = len(r.content)
+                        with stat_lock:
+                            done_segs[0] += 1
+                            done_bytes[0] += sz
+                            cnt = done_segs[0]
+                            mb = done_bytes[0] / (1024.0 * 1024.0)
+                            now = time.monotonic()
+                            if progress_cb and (now - last_emit[0] >= 0.2 or cnt == total_segs):
+                                last_emit[0] = now
+                                pct = 0.05 + 0.89 * (cnt / max(1, total_segs))
+                                progress_cb(pct, f"切り抜き区間を並列取得中 {pct*100:.0f}% ({mb:.1f} MB)")
+                        return
+                    except Exception as exc:
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("Cancelled by user") from exc
+                        last_e = exc
+                        if attempt < 2:
+                            time.sleep(0.3 * (attempt + 1))
+                if last_e is not None:
+                    raise last_e
+
+            pool = ThreadPoolExecutor(max_workers=min(6, len(dl_jobs)))
+            futs = [pool.submit(fetch_seg, item) for item in dl_jobs]
+            pending = set(futs)
+            try:
+                while pending:
+                    if cancel_check and cancel_check():
+                        for f in futs:
+                            f.cancel()
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        raise RuntimeError("Cancelled by user")
+                    finished, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for df in finished:
+                        df.result()
+            except Exception as exc:
+                for f in futs:
+                    f.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                if (cancel_check and cancel_check()) or "Cancelled" in str(exc):
+                    raise RuntimeError("Cancelled by user") from exc
+                return None
+            finally:
+                for wc in thread_clients:
+                    try:
+                        wc.close()
+                    except Exception:
+                        pass
+                if not (cancel_check and cancel_check()):
+                    pool.shutdown(wait=True)
+
+        if cancel_check and cancel_check():
+            raise RuntimeError("Cancelled by user")
+
+        if progress_cb:
+            progress_cb(0.95, "映像と音声を結合中...")
+
+        out_mkv = work_dir / "source_raw.mkv"
+        mux_cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
+        v_base = stream_plans[0][2][0][1]
+        for idx, _, sg in stream_plans:
+            sdir = seg_dirs[idx]
+            cf = work_dir / f"_hls_concat_{idx}.txt"
+            concat_files.append(cf)
+            c_lines = []
+            for seg_i, _, _, _ in sg:
+                p_str = (sdir / f"{seg_i:05d}.ts").as_posix().replace("'", r"\'")
+                c_lines.append(f"file '{p_str}'")
+            cf.write_text("\n".join(c_lines), encoding="utf-8")
+            shift = sg[0][1] - v_base if idx > 0 else 0.0
+            if abs(shift) > 0.01:
+                mux_cmd += ["-itsoffset", f"{shift:.3f}"]
+            mux_cmd += ["-f", "concat", "-safe", "0", "-i", str(cf)]
+
+        for idx in range(len(stream_plans)):
+            mux_cmd += ["-map", f"{idx}:0"]
+        mux_cmd += ["-c", "copy", "-f", "matroska", str(out_mkv)]
+
+        mux_proc = subprocess.Popen(
+            mux_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc_hook:
+            proc_hook(mux_proc, True)
+        try:
+            while mux_proc.poll() is None:
+                if cancel_check and cancel_check():
+                    mux_proc.kill()
+                    raise RuntimeError("Cancelled by user")
+                time.sleep(0.1)
+        finally:
+            if proc_hook:
+                proc_hook(mux_proc, False)
+
+        if mux_proc.returncode != 0 or not out_mkv.exists() or out_mkv.stat().st_size == 0:
+            out_mkv.unlink(missing_ok=True)
+            return None
+
+        trim_offset = max(0.0, s - base_start)
+        _, _, _, clip_file_dur = get_video_metadata(str(out_mkv))
+        if clip_file_dur > 0 and trim_offset >= max(0.5, clip_file_dur - 0.5):
+            out_mkv.unlink(missing_ok=True)
+            return None
+        if progress_cb:
+            progress_cb(0.96, "切り抜き素材の取得が完了しました")
+        return out_mkv, trim_offset, target_dur
+    finally:
+        for cf in concat_files:
+            cf.unlink(missing_ok=True)
+        for sd in seg_dirs:
+            shutil.rmtree(sd, ignore_errors=True)
 
 
 def _direct_ffmpeg_clip_download(
@@ -542,6 +841,21 @@ def _direct_ffmpeg_clip_download(
         f_url = str(fmt.get("url") or "")
         if not (f_url.startswith("http://") or f_url.startswith("https://")):
             return None
+
+    hls_fast = _parallel_hls_clip_download(
+        ffmpeg_exe,
+        info,
+        selected,
+        cookiejar,
+        work_dir,
+        max(0.0, float(clip_start_sec)),
+        clip_end_sec,
+        progress_cb,
+        cancel_check,
+        proc_hook,
+    )
+    if hls_fast is not None:
+        return hls_fast
 
     out_mkv = work_dir / "source_raw.mkv"
     s = max(0.0, float(clip_start_sec))
@@ -852,18 +1166,23 @@ def download_video_and_chat(
             if not (cancel_check and cancel_check()):
                 pool.shutdown(wait=True)
 
-    def _run_full_with_fallbacks(preferred_opts: Optional[dict] = None) -> None:
+    def _run_full_with_fallbacks(preferred_opts: Optional[dict] = None, preferred_info: Optional[dict] = None) -> None:
         strategies: list[dict] = []
+        is_portrait = _is_portrait_info(preferred_info)
         if preferred_opts is not None:
             strategies.append(build_dl_opts(preferred_opts, with_subs=False))
         for ck in ([cookie_path, None] if cookie_path else [None]):
             for prefer_hls in (False, True):
                 o = _common_ytdlp_opts(ck)
-                o["format"] = _build_format_selector(encode.resolution, encode.max_fps, prefer_hls=prefer_hls)
+                o["format"] = _build_format_selector(
+                    encode.resolution, encode.max_fps, prefer_hls=prefer_hls, is_portrait=is_portrait
+                )
                 strategies.append(build_dl_opts(o, with_subs=False))
         if not twitch_mode:
             o_alt = _common_ytdlp_opts(None)
-            o_alt["format"] = _build_format_selector(encode.resolution, encode.max_fps, prefer_hls=True)
+            o_alt["format"] = _build_format_selector(
+                encode.resolution, encode.max_fps, prefer_hls=True, is_portrait=is_portrait
+            )
             o_alt["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "web"]}}
             strategies.append(build_dl_opts(o_alt, with_subs=False))
 
@@ -877,7 +1196,10 @@ def download_video_and_chat(
                 for stale in work_dir.glob("source*.part*"):
                     stale.unlink(missing_ok=True)
                 with yt_dlp.YoutubeDL(s_opts) as ydl:
-                    ydl.download([url])
+                    if idx == 0 and preferred_info is not None:
+                        ydl.process_ie_result(copy.deepcopy(preferred_info), download=True)
+                    else:
+                        ydl.download([url])
                 if any(
                     p.stem in ("source", "source_raw") and p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
                     for p in work_dir.iterdir()
@@ -899,7 +1221,7 @@ def download_video_and_chat(
             if progress_cb:
                 progress_cb(0.02, "切り抜き用ストリーム情報を取得中...")
             resolved_opts, info, cj = _resolve_working_extraction(
-                url, encode, cookie_path, twitch_mode, cancel_check
+                url, encode, cookie_path, twitch_mode, cancel_check, prefer_hls_first=True
             )
 
             if cancel_check and cancel_check():
@@ -926,7 +1248,9 @@ def download_video_and_chat(
                     progress_cb(0.05, "別経路 (HLS) で切り抜き取得を再試行中...")
                 alt_opts = _common_ytdlp_opts(None)
                 alt_opts["skip_download"] = True
-                alt_opts["format"] = _build_format_selector(encode.resolution, encode.max_fps, prefer_hls=True)
+                alt_opts["format"] = _build_format_selector(
+                    encode.resolution, encode.max_fps, prefer_hls=True, is_portrait=_is_portrait_info(info)
+                )
                 with yt_dlp.YoutubeDL(alt_opts) as ydl2:
                     info2 = ydl2.extract_info(url, download=False) or {}
                     cj2 = ydl2.cookiejar
@@ -965,10 +1289,10 @@ def download_video_and_chat(
     else:
         if progress_cb:
             progress_cb(0.02, "ダウンロード用ストリームを検証中...")
-        resolved_opts, _, _ = _resolve_working_extraction(
-            url, encode, cookie_path, twitch_mode, cancel_check
+        resolved_opts, resolved_info, _ = _resolve_working_extraction(
+            url, encode, cookie_path, twitch_mode, cancel_check, prefer_hls_first=True
         )
-        tasks = [lambda: _run_full_with_fallbacks(resolved_opts)]
+        tasks = [lambda: _run_full_with_fallbacks(resolved_opts, resolved_info)]
         if need_chat:
             tasks.append(dl_chat_worker)
         _run_cancellable_pool(tasks)

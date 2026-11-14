@@ -598,7 +598,7 @@ export function SettingsAuthView({
               NicoTube Studio 本体
             </div>
             <div className="font-mono-tabular mt-1 text-[13px] font-medium" style={{ color: 'var(--md-on-surface)' }}>
-              v{appUpdateState?.version || '0.2.4'}
+              v{appUpdateState?.version || '0.2.5'}
             </div>
             <div
               className="mt-0.5 truncate text-[11px]"

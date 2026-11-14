@@ -166,7 +166,9 @@ class DanmakuEngine:
         self.width = width
         self.height = height
         self.style = style
-        self.scale = height / 360.0
+        # Use short edge on vertical (portrait) videos so text is not oversized vs narrow width
+        ref_height = min(width, height) if height > width else height
+        self.scale = ref_height / 360.0
         self.base_font_px = 24.0 * self.scale * style.font_scale
         self.lane_height = max(12.0, self.base_font_px * style.line_height_ratio)
         self.font_resolver = FontResolver(style.font_family, style.font_weight)
